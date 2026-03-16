@@ -13,6 +13,7 @@ def setup():
     """Initialize the notes application."""
     # Define the notes directory in HOME
     notes_dir = Path.home() / ".notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
 
     # Check if notes directory exists (silent check for CLI version)
     if not notes_dir.exists():

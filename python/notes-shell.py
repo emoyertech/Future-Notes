@@ -69,6 +69,7 @@ def command_loop():
 
 def finish():
     """Clean up and exit the application."""
+    
     print("\nGoodbye!")
     sys.exit(0)
 
@@ -77,6 +78,7 @@ def main():
     """Main entry point for the notes application."""
     # Setup
     notes_dir = setup()
+    setup()
 
     # Command loop
     command_loop()
