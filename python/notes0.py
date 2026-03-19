@@ -6,6 +6,7 @@ import datetime
 from pathlib import Path
 from typing import Optional, List
 from fastapi.responses import HTMLResponse
+from fastapi import Form
 
 # Core dependencies (Ensure these are installed: pip install fastapi pandas uvicorn)
 try:
@@ -119,6 +120,48 @@ def api_home():
     </html>
     """
 
+@app.get("/notes/{filename}", response_class=HTMLResponse)
+def view_note_api(filename: str, edit: bool = False):
+    filepath = config["notes"] / filename
+    meta, body = parse_note(filepath)
+    
+    # If 'edit=true' is in the URL, show a text area instead of plain text
+    content_area = f"""
+        <form action="/notes/{filename}/save" method="post">
+            <textarea name="content" style="width:100%; height:400px; font-family:monospace; padding:10px;">{body}</textarea>
+            <br><br>
+            <button type="submit" style="padding:10px 20px; background:#28a745; color:white; border:none; border-radius:4px; cursor:pointer;">Save Changes</button>
+            <a href="/notes/{filename}" style="margin-left:10px;">Cancel</a>
+        </form>
+    """ if edit else f"""
+        <pre style="white-space: pre-wrap; background: #eee; padding: 15px;">{body}</pre>
+        <a href="/notes/{filename}?edit=true" style="display:inline-block; margin-top:10px; padding:8px 15px; background:#007bff; color:white; text-decoration:none; border-radius:4px;">Edit Note</a>
+    """
+
+    return f"""
+    <html>
+        <body style="font-family: sans-serif; max-width: 800px; margin: 40px auto; line-height: 1.6;">
+            <a href="/">← Back to List</a>
+            <h1>{meta.get('title', filename)}</h1>
+            {content_area}
+        </body>
+    </html>
+    """
+
+@app.post("/notes/{filename}/save")
+def save_note_api(filename: str, content: str = Form(...)):
+    filepath = config["notes"] / filename
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    # We parse the existing note to keep the old metadata (title/tags)
+    meta, _ = parse_note(filepath)
+    # Save the new body with the original metadata
+    save_note(filepath, meta, content)
+    
+    # Redirect back to the view page after saving
+    return HTMLResponse(content=f'<script>window.location.href="/notes/{filename}";</script>')
+
 # --- 4. CLI COMMANDS ---
 
 def list_notes(filter_tag: Optional[str] = None):
@@ -194,6 +237,22 @@ def delete_note(args: List[str]):
         print("Deleted.")
     else: print("Action cancelled or note not found.")
 
+def read_note():
+    name = input("Enter note name to view: ").strip()
+    if not any(name.endswith(ext) for ext in ['.md', '.txt']):
+        name += ".md"
+    
+    filepath = config["notes"] / name
+    if filepath.exists():
+        meta, body = parse_note(filepath)
+        print(f"\n--- {meta.get('title', name)} ---")
+        print(f"Tags: {', '.join(meta.get('tags', []))}")
+        print("-" * 30)
+        print(body)
+        print("-" * 30)
+    else:
+        print("File not found.")
+
 # --- 5. MAIN INTERFACE ---
 
 def start_api():
@@ -210,7 +269,7 @@ def start_api():
 def main_menu():
     while True:
         print("\n--- Main Menu ---")
-        print("[L]ist  [S]earch  [E]dit  [D]elete  [A]PI-Start  [Q]uit")
+        print("[L]ist  [V]iew  [S]earch  [E]dit  [D]elete  [A]PI-Start  [Q]uit")
         choice = input("Select an action: ").strip().lower()
 
         if choice in ('l', 'list'): list_notes()
@@ -218,6 +277,7 @@ def main_menu():
         elif choice in ('e', 'edit'): edit_note([])
         elif choice in ('d', 'delete'): delete_note([])
         elif choice in ('a', 'api'): start_api()
+        elif choice in ('v', 'view'): read_note([])
         elif choice in ('q', 'quit'): break
 
 if __name__ == "__main__":
@@ -230,5 +290,10 @@ if __name__ == "__main__":
         elif cmd == "edit": edit_note(sys.argv[2:])
         elif cmd == "delete": delete_note(sys.argv[2:])
         elif cmd == "api": start_api()
+        elif cmd == "view": read_note()
         else:
             print("Unknown command. Use: list, search, edit, delete, or api.")
+
+# Update your main_menu list:
+# print("[L]ist  [V]iew  [S]earch  [E]dit  [D]elete  [A]PI-Start  [Q]uit")
+# elif choice in ('v', 'view'): read_note()
