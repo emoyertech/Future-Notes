@@ -1,0 +1,34 @@
+{% extends "layout.html" %}
+
+{% block sidebar %}
+<div class="sidebar">
+    <h3>Post a Listing</h3>
+    <form action="/create" method="POST" enctype="multipart/form-data">
+        <input type="text" name="make" class="input" placeholder="Make (e.g. BMW)" required>
+        <input type="text" name="model" class="input" placeholder="Model" required>
+        <input type="number" name="year" class="input" placeholder="Year" required>
+        <input type="number" name="price" class="input" placeholder="Price ($)" required>
+        <input type="number" name="mileage" class="input" placeholder="Mileage (mi)" required>
+        <label style="font-size: 0.8em; color: #666;">Attach Photo:</label>
+        <input type="file" name="photo" class="input" accept="image/*" required>
+        <button type="submit" class="btn" style="width: 100%;">🚀 Publish</button>
+    </form>
+</div>
+{% endblock %}
+
+{% block main_content %}
+    <h1>Live Inventory</h1>
+    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 20px;">
+        {% for car in cars %}
+        <div class="card">
+            <a href="/delete/{{ car.id }}" style="position:absolute; top:10px; right:10px; text-decoration:none;" onclick="return confirm('Delete?')">🗑️</a>
+            <img src="{{ url_for('uploaded_file', filename=car.image_path) }}" onerror="this.src='https://via.placeholder.com'">
+            <div style="padding: 15px;">
+                <h3 style="margin:0;">{{ car.year }} {{ car.make }} {{ car.model }}</h3>
+                <p style="color: #28a745; font-weight: bold; font-size: 1.2em;">${{ "{:,}".format(car.price or 0) }}</p>
+                <p style="font-size: 0.9em; color: #666;">{{ "{:,}".format(car.mileage or 0) }} mi</p>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+{% endblock %}

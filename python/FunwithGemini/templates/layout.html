@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vehicle Marketplace</title>
+    <style>
+        :root { --primary: #1877f2; --bg: #f0f2f5; --danger: #dc3545; }
+        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); margin: 0; }
+        .navbar { background: white; padding: 15px 30px; display: flex; justify-content: space-between; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .container { display: flex; max-width: 1200px; margin: 20px auto; padding: 0 20px; gap: 20px; }
+        .sidebar { width: 320px; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); height: fit-content; }
+        .main { flex: 1; }
+        .card { background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px; position: relative; }
+        .card img { width: 100%; height: 180px; object-fit: cover; }
+        .btn { padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer; font-weight: bold; background: var(--primary); color: white; text-decoration: none; display: inline-block; text-align: center; }
+        .input { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+        @media (max-width: 768px) { .container { flex-direction: column; } .sidebar { width: 100%; } }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h2 style="color:var(--primary); margin:0;">🚗 Market</h2>
+        <div>
+            {% block navbar_content %}
+                {% if session.username %}
+                    Welcome, <b>{{ session.username }}</b> | <a href="/logout">Logout</a>
+                {% endif %}
+            {% endblock %}
+        </div>
+    </div>
+    <div class="container">
+        {% block sidebar %}{% endblock %}
+        <div class="main">
+            {% block main_content %}{% endblock %}
+        </div>
+    </div>
+</body>
+</html>

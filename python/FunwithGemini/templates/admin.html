@@ -1,0 +1,42 @@
+{% extends "layout.html" %}
+{% block content %}
+<div style="flex: 1; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);">
+    <h1>Admin Dashboard</h1>
+    <p>Manage registered users and monitor account statuses.</p>
+    
+    <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+        <thead>
+            <tr style="background: #f8f9fa; border-bottom: 2px solid #dee2e6; text-align: left;">
+                <th style="padding: 12px;">ID</th>
+                <th style="padding: 12px;">Username</th>
+                <th style="padding: 12px;">Email</th>
+                <th style="padding: 12px;">Role</th>
+                <th style="padding: 12px;">Status</th>
+                <th style="padding: 12px;">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for user in users %}
+            <tr style="border-bottom: 1px solid #eee;">
+                <td style="padding: 12px;">{{ user.id }}</td>
+                <td style="padding: 12px;">{{ user.username }}</td>
+                <td style="padding: 12px;">{{ user.email }}</td>
+                <td style="padding: 12px;"><strong>{{ user.role.upper() }}</strong></td>
+                <td style="padding: 12px;">
+                    {% if user.is_banned %}
+                        <span style="color: red;">🚫 Banned</span>
+                    {% elif user.is_verified %}
+                        <span style="color: green;">✅ Verified</span>
+                    {% else %}
+                        <span style="color: orange;">⏳ Pending</span>
+                    {% endif %}
+                </td>
+                <td style="padding: 12px;">
+                    <a href="/admin/user/{{ user.id }}/edit" style="color: #1877f2; text-decoration: none;">Edit</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

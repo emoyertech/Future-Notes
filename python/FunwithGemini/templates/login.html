@@ -1,0 +1,24 @@
+{% extends "layout.html" %}
+{% block sidebar %}{% endblock %} <!-- Keep empty for full-width feel -->
+
+{% block main_content %}
+<div style="background: white; max-width: 400px; margin: 40px auto; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center;">
+    <h1 style="color: var(--primary);">Login</h1>
+    {% if error %}<p style="color: red;">{{ error }}</p>{% endif %}
+    <form action="/login" method="POST">
+        <input type="text" name="username" class="input" placeholder="Username" required>
+        <div style="position: relative;">
+            <input type="password" id="login-pwd" name="password" class="input" placeholder="Password" required>
+            <span onclick="togglePwd('login-pwd')" style="position: absolute; right: 10px; top: 12px; cursor: pointer; color: var(--primary); font-size: 12px;">👁️ Show</span>
+        </div>
+        <button type="submit" class="btn" style="width: 100%;">Log In</button>
+    </form>
+    <p style="margin-top: 20px;">Don't have an account? <a href="/register">Sign up here</a></p>
+</div>
+<script>
+    function togglePwd(id) {
+        var x = document.getElementById(id);
+        x.type = (x.type === "password") ? "text" : "password";
+    }
+</script>
+{% endblock %}
