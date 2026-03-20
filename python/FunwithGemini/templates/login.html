@@ -1,23 +1,34 @@
 {% extends "layout.html" %}
-{% block sidebar %}{% endblock %} <!-- Keep empty for full-width feel -->
 
-{% block main_content %}
-<div style="background: white; max-width: 400px; margin: 40px auto; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center;">
-    <h1 style="color: var(--primary);">Login</h1>
-    {% if error %}<p style="color: red;">{{ error }}</p>{% endif %}
+{% block main %}
+<div style="background: white; max-width: 400px; margin: 80px auto; padding: 30px; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; border: 1px solid #eee;">
+    <h1 style="color: #ff5a5f; margin-bottom: 5px;">letgo</h1>
+    <p style="color: #666; margin-bottom: 25px;">Log in to start selling.</p>
+
+    {% if error %}
+        <p style="color: red; font-size: 14px;">{{ error }}</p>
+    {% endif %}
+
     <form action="/login" method="POST">
-        <input type="text" name="username" class="input" placeholder="Username" required>
-        <div style="position: relative;">
-            <input type="password" id="login-pwd" name="password" class="input" placeholder="Password" required>
-            <span onclick="togglePwd('login-pwd')" style="position: absolute; right: 10px; top: 12px; cursor: pointer; color: var(--primary); font-size: 12px;">👁️ Show</span>
+        <input type="text" name="username" placeholder="Username" style="width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 8px;" required>
+        
+        <div style="position: relative; margin-bottom: 20px;">
+            <input type="password" id="login-pwd" name="password" placeholder="Password" style="width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px;" required>
+            <span onclick="togglePwd()" style="position: absolute; right: 10px; top: 12px; cursor: pointer; color: #ff5a5f; font-size: 12px;">Show</span>
         </div>
-        <button type="submit" class="btn" style="width: 100%;">Log In</button>
+
+        <button type="submit" style="background: #ff5a5f; color: white; width: 100%; border: none; padding: 12px; border-radius: 50px; font-weight: bold; font-size: 16px; cursor: pointer;">
+            Log In
+        </div>
     </form>
-    <p style="margin-top: 20px;">Don't have an account? <a href="/register">Sign up here</a></p>
+
+    <hr style="margin: 25px 0; border: 0; border-top: 1px solid #eee;">
+    <p>New to letgo? <a href="/register" style="color: #ff5a5f; text-decoration: none; font-weight: bold;">Create an account</a></p>
 </div>
+
 <script>
-    function togglePwd(id) {
-        var x = document.getElementById(id);
+    function togglePwd() {
+        var x = document.getElementById("login-pwd");
         x.type = (x.type === "password") ? "text" : "password";
     }
 </script>
