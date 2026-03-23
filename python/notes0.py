@@ -1,4 +1,34 @@
 #!/usr/bin/env python3
+"""Future Proof Notes Hub.
+
+Developer overview:
+- FastAPI monolith serving HTML pages and API endpoints.
+- Filesystem-first storage for notes, datasets, and videos under ~/.notes.
+- SQLite auth DB for users/sessions/locks/messages/follows/notifications/file metadata.
+- Social layer: follow, notifications, profiles, recommendations.
+- Data/video import layer: local upload + external text/YouTube import.
+- Global UX layer: theme/layout toolbar persisted in localStorage.
+
+Navigation guide for maintainers:
+1) Initialization and config
+2) Core helpers (storage, auth, social, import)
+3) Shared UI style/script block (COMMON_STYLE)
+4) Routes grouped by feature (auth/account/admin/api/home/content)
+
+Function index (quick lookup):
+- Initialization/config: setup, init_auth_db
+- Notes/datasets: parse_note, save_note, get_dataset_info, validate_dataset_content
+- Public imports: search_public_texts, import_public_text_as_note
+- YouTube flow: search_youtube_videos, import_youtube_video_with_progress,
+  run_youtube_import_job, start_youtube_import_route, youtube_import_progress_route
+- Auth/session: create_user_account, create_session, get_current_user, get_api_user
+- Privacy/social: upsert_file_record, file_visible_to_user, follow_user,
+  notify_followers_public_upload
+- Main web routes: web_home, view_note, view_full_dataset, view_video
+- Admin/API routes: admin_control_page, admin_users_page, api_login, api_me,
+  api_list_notes, api_messages
+"""
+
 import os, re, sys, markdown2, subprocess, datetime, shutil
 import html, secrets
 import sqlite3, hashlib
@@ -16,6 +46,7 @@ import pandas as pd
 
 # --- 1. INITIALIZATION ---
 def setup():
+    """Create base filesystem directories and return runtime paths."""
     base = Path.home() / ".notes"
     notes, data = base / "notes", base / "datasets"
     videos, thumbs = base / "videos", base / "thumbnails"
@@ -39,6 +70,7 @@ YOUTUBE_IMPORT_JOBS_LOCK = threading.Lock()
 
 # --- 2. CORE LOGIC ---
 def parse_note(f: Path):
+    """Parse note frontmatter/body from a markdown file."""
     if not f.exists(): return {"title": f.stem, "tags": []}, ""
     content = f.read_text(encoding='utf-8')
     # Match YAML-style frontmatter
@@ -54,12 +86,14 @@ def parse_note(f: Path):
     return meta, match.group(2).strip()
 
 def save_note(f: Path, meta: dict, body: str):
+    """Persist note metadata and markdown body using simple frontmatter."""
     if isinstance(meta.get('tags'), list): 
         meta['tags'] = f"[{', '.join(meta['tags'])}]"
     head = "\n".join([f"{k}: {v}" for k, v in meta.items()])
     f.write_text(f"---\n{head}\n---\n\n{body}", encoding='utf-8')
 
 def get_dataset_info(name: str, rows_limit: int = 3):
+    """Read a dataset file and return column/preview metadata for rendering."""
     f = config["datasets"] / name
     if not f.exists(): return None
     try:
@@ -71,6 +105,7 @@ def get_dataset_info(name: str, rows_limit: int = 3):
     except: return {"id": name, "rows": 0, "preview": []}
 
 def validate_dataset_content(filename: str, content: str):
+    """Validate edited dataset text by parsing it according to file extension."""
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
         pd.read_csv(io.StringIO(content))
@@ -81,9 +116,11 @@ def validate_dataset_content(filename: str, content: str):
     raise HTTPException(status_code=400, detail="Unsupported dataset format")
 
 def sanitize_note_basename(title: str) -> str:
+    """Create a filesystem-safe note base name from a title string."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", (title or "").strip()).strip("_") or "note"
 
 def choose_plain_text_url(formats: dict) -> Optional[str]:
+    """Select the best plain-text URL from a Gutendex formats map."""
     preferred_keys = [
         "text/plain; charset=utf-8",
         "text/plain; charset=us-ascii",
@@ -99,6 +136,7 @@ def choose_plain_text_url(formats: dict) -> Optional[str]:
     return None
 
 def search_public_texts(query: str, limit: int = 8) -> List[dict]:
+    """Search Gutendex and return normalized public-domain text results."""
     term = (query or "").strip()
     if not term:
         return []
@@ -120,6 +158,7 @@ def search_public_texts(query: str, limit: int = 8) -> List[dict]:
     return results
 
 def validate_public_text_url(source_url: str) -> str:
+    """Allow only safe Gutenberg-hosted plain-text URLs for importing."""
     parsed = urlparse((source_url or "").strip())
     host = (parsed.netloc or "").lower()
     allowed_hosts = ("gutenberg.org", "www.gutenberg.org", "aleph.gutenberg.org")
@@ -132,6 +171,7 @@ def validate_public_text_url(source_url: str) -> str:
     return source_url.strip()
 
 def download_public_text(source_url: str, max_bytes: int = 2_500_000) -> str:
+    """Download a public text file with size and encoding safeguards."""
     req = UrlRequest(source_url, headers={"User-Agent": "future-proof-notes/1.0"})
     with urlopen(req, timeout=20) as response:
         raw = response.read(max_bytes + 1)
@@ -145,6 +185,7 @@ def download_public_text(source_url: str, max_bytes: int = 2_500_000) -> str:
     return raw.decode("utf-8", errors="replace")
 
 def import_public_text_as_note(title: str, source_url: str) -> str:
+    """Import a public text URL as a new markdown note file."""
     clean_title = (title or "").strip() or "Imported Text"
     validated_url = validate_public_text_url(source_url)
     text_body = download_public_text(validated_url)
@@ -161,9 +202,11 @@ def import_public_text_as_note(title: str, source_url: str) -> str:
     return candidate
 
 def get_yt_dlp_path() -> Optional[str]:
+    """Return the local yt-dlp executable path if available."""
     return shutil.which("yt-dlp")
 
 def get_setup_checks() -> List[dict]:
+    """Return optional dependency checks for UI setup guidance."""
     checks = [
         {
             "name": "yt-dlp",
@@ -181,6 +224,7 @@ def get_setup_checks() -> List[dict]:
     return checks
 
 def normalize_youtube_url(value: str) -> str:
+    """Validate and normalize user-entered YouTube IDs/URLs."""
     raw = (value or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="YouTube URL is required")
@@ -195,6 +239,7 @@ def normalize_youtube_url(value: str) -> str:
     return raw
 
 def search_youtube_videos(query: str, limit: int = 6) -> List[dict]:
+    """Search YouTube via yt-dlp and return simplified result objects."""
     term = (query or "").strip()
     if not term:
         return []
@@ -233,6 +278,7 @@ def search_youtube_videos(query: str, limit: int = 6) -> List[dict]:
     return results
 
 def import_youtube_video(video_url: str) -> str:
+    """Download a YouTube video file and return its saved filename."""
     yt_dlp_path = get_yt_dlp_path()
     if not yt_dlp_path:
         raise HTTPException(status_code=500, detail="yt-dlp is not installed")
@@ -267,6 +313,7 @@ def import_youtube_video(video_url: str) -> str:
     return filename
 
 def import_youtube_video_with_progress(video_url: str, progress_callback=None) -> str:
+    """Download a YouTube video while emitting progress updates to a callback."""
     yt_dlp_path = get_yt_dlp_path()
     if not yt_dlp_path:
         raise HTTPException(status_code=500, detail="yt-dlp is not installed")
@@ -333,12 +380,14 @@ def import_youtube_video_with_progress(video_url: str, progress_callback=None) -
     return filename
 
 def finalize_imported_video_for_user(user, filename: str, private_upload: bool):
+    """Save ownership/visibility metadata and follower notifications for an imported video."""
     is_public = not bool(private_upload)
     upsert_file_record("video", filename, user["id"] if user else None, is_public)
     if user:
         notify_followers_public_upload(user, "video", filename)
 
 def set_youtube_job(job_id: str, **updates):
+    """Thread-safe update helper for in-memory YouTube import jobs."""
     with YOUTUBE_IMPORT_JOBS_LOCK:
         job = YOUTUBE_IMPORT_JOBS.get(job_id)
         if not job:
@@ -346,6 +395,7 @@ def set_youtube_job(job_id: str, **updates):
         job.update(updates)
 
 def run_youtube_import_job(job_id: str, video_url: str, user_snapshot, private_upload: bool):
+    """Background worker that performs YouTube import and records job state."""
     try:
         set_youtube_job(job_id, status="downloading", progress=1.0, message="Starting download...")
 
@@ -360,49 +410,59 @@ def run_youtube_import_job(job_id: str, video_url: str, user_snapshot, private_u
         set_youtube_job(job_id, status="error", message=str(ex))
 
 def h(value) -> str:
+    """HTML-escape any value for safe interpolation in templates."""
     return html.escape(str(value), quote=True)
 
 def u(value: str) -> str:
+    """URL-encode path/query values for safe link construction."""
     return quote(value, safe="")
 
 def safe_name(name: str) -> str:
+    """Return basename only, stripping any parent directory components."""
     return Path(name or "").name
 
 def ensure_safe_filename(name: str) -> str:
+    """Validate filename safety and reject traversal or ambiguous names."""
     cleaned = safe_name(name)
     if not cleaned or cleaned != name or cleaned in {".", ".."}:
         raise HTTPException(status_code=400, detail="Invalid filename")
     return cleaned
 
 def get_or_create_csrf_token(request: Request) -> str:
+    """Reuse existing CSRF cookie token or generate a new one."""
     existing = request.cookies.get("csrf_token")
     if existing and len(existing) >= 16:
         return existing
     return secrets.token_urlsafe(24)
 
 def validate_csrf(request: Request, csrf_token: str):
+    """Validate submitted CSRF token against cookie value."""
     cookie = request.cookies.get("csrf_token")
     if not csrf_token or not cookie or not secrets.compare_digest(csrf_token, cookie):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
 def get_db_connection():
+    """Open a SQLite connection configured to return row objects."""
     conn = sqlite3.connect(config["auth_db"])
     conn.row_factory = sqlite3.Row
     return conn
 
 def get_user_count() -> int:
+    """Return the total number of registered user accounts."""
     conn = get_db_connection()
     count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
     conn.close()
     return count
 
 def validate_new_account_input(clean_user: str, password: str):
+    """Enforce username format and minimum password strength policy."""
     if not re.fullmatch(r"[a-z0-9_.-]{3,32}", clean_user):
         raise HTTPException(status_code=400, detail="Invalid username format")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
 def create_user_account(clean_user: str, password: str, role: str = "user", public_name: Optional[str] = None):
+    """Create a user account row and return the newly created user profile."""
     if role not in {"user", "admin"}:
         raise HTTPException(status_code=400, detail="Invalid role")
     validate_new_account_input(clean_user, password)
@@ -425,6 +485,7 @@ def create_user_account(clean_user: str, password: str, role: str = "user", publ
     return user_row
 
 def init_auth_db():
+    """Initialize auth/social tables and apply lightweight schema migrations."""
     conn = get_db_connection()
     conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -511,11 +572,13 @@ def init_auth_db():
     conn.close()
 
 def hash_password(password: str) -> str:
+    """Hash a password with per-password salt using SHA-256."""
     salt = secrets.token_hex(16)
     digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
     return f"{salt}${digest}"
 
 def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify plain password against stored salted SHA-256 hash."""
     try:
         salt, digest = stored_hash.split("$", 1)
     except ValueError:
@@ -524,6 +587,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
     return secrets.compare_digest(calc, digest)
 
 def create_session(user_id: int) -> str:
+    """Create a persistent auth session token for a user."""
     token = secrets.token_urlsafe(32)
     conn = get_db_connection()
     conn.execute(
@@ -535,12 +599,14 @@ def create_session(user_id: int) -> str:
     return token
 
 def clear_session(token: str):
+    """Delete a session token from the sessions table."""
     conn = get_db_connection()
     conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
     conn.commit()
     conn.close()
 
 def get_current_user(request: Request):
+    """Resolve current user from auth cookie token for web routes."""
     token = request.cookies.get("auth_token")
     if not token:
         return None
@@ -558,6 +624,7 @@ def get_current_user(request: Request):
     return row
 
 def get_user_by_session_token(token: str):
+    """Resolve user row from session token for API authentication."""
     if not token:
         return None
     conn = get_db_connection()
@@ -574,6 +641,7 @@ def get_user_by_session_token(token: str):
     return row
 
 def get_api_user(request: Request):
+    """Authenticate API request via Bearer token and return user/token."""
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -584,6 +652,7 @@ def get_api_user(request: Request):
     return user, token
 
 def get_unread_message_count(user_id: int) -> int:
+    """Count unread inbox messages for a user."""
     conn = get_db_connection()
     row = conn.execute(
         "SELECT COUNT(*) AS c FROM messages WHERE recipient_user_id = ? AND read_at IS NULL",
@@ -593,6 +662,7 @@ def get_unread_message_count(user_id: int) -> int:
     return row["c"] if row else 0
 
 def get_unread_notification_count(user_id: int) -> int:
+    """Count unread social notifications for a user."""
     conn = get_db_connection()
     row = conn.execute(
         "SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND read_at IS NULL",
@@ -602,6 +672,7 @@ def get_unread_notification_count(user_id: int) -> int:
     return row["c"] if row else 0
 
 def upsert_file_record(file_type: str, filename: str, owner_user_id: Optional[int], is_public: bool):
+    """Insert or update ownership/visibility metadata for a stored file."""
     conn = get_db_connection()
     conn.execute(
         """
@@ -618,6 +689,7 @@ def upsert_file_record(file_type: str, filename: str, owner_user_id: Optional[in
     conn.close()
 
 def get_file_record(file_type: str, filename: str):
+    """Fetch a single file metadata row by type and filename."""
     conn = get_db_connection()
     row = conn.execute(
         "SELECT * FROM file_records WHERE file_type = ? AND filename = ?",
@@ -627,6 +699,7 @@ def get_file_record(file_type: str, filename: str):
     return row
 
 def file_is_public(file_type: str, filename: str) -> bool:
+    """Determine public visibility for a file using metadata and lock fallback."""
     row = get_file_record(file_type, filename)
     if row:
         return bool(row["is_public"])
@@ -635,6 +708,7 @@ def file_is_public(file_type: str, filename: str) -> bool:
     return True
 
 def file_visible_to_user(file_type: str, filename: str, user) -> bool:
+    """Check whether a viewer can access a file given privacy/ownership rules."""
     row = get_file_record(file_type, filename)
     if row:
         if row["is_public"]:
@@ -652,6 +726,7 @@ def file_visible_to_user(file_type: str, filename: str, user) -> bool:
     return True
 
 def notify_followers_public_upload(actor_user, file_type: str, filename: str):
+    """Send notifications to followers when a user uploads a public file."""
     if not actor_user:
         return
     if not file_is_public(file_type, filename):
@@ -681,6 +756,7 @@ def notify_followers_public_upload(actor_user, file_type: str, filename: str):
     conn.close()
 
 def display_name(user_row) -> str:
+    """Return preferred display name (public name fallback to username)."""
     if not user_row:
         return ""
     value = user_row["public_name"] if "public_name" in user_row.keys() else None
@@ -688,6 +764,7 @@ def display_name(user_row) -> str:
     return value or user_row["username"]
 
 def get_following_rows(user_id: int):
+    """List users currently followed by the given user."""
     conn = get_db_connection()
     rows = conn.execute(
         """
@@ -703,6 +780,7 @@ def get_following_rows(user_id: int):
     return rows
 
 def get_follower_rows(user_id: int):
+    """List users who follow the given user."""
     conn = get_db_connection()
     rows = conn.execute(
         """
@@ -718,6 +796,7 @@ def get_follower_rows(user_id: int):
     return rows
 
 def is_following(follower_user_id: int, followed_user_id: int) -> bool:
+    """Return whether follower currently follows target user."""
     conn = get_db_connection()
     row = conn.execute(
         "SELECT 1 FROM follows WHERE follower_user_id = ? AND followed_user_id = ?",
@@ -727,6 +806,7 @@ def is_following(follower_user_id: int, followed_user_id: int) -> bool:
     return bool(row)
 
 def file_exists_by_type(file_type: str, filename: str) -> bool:
+    """Check whether a file exists in its type-specific storage directory."""
     if file_type == "note":
         return (config["notes"] / filename).exists()
     if file_type == "dataset":
@@ -736,6 +816,7 @@ def file_exists_by_type(file_type: str, filename: str) -> bool:
     return False
 
 def file_link_by_type(file_type: str, filename: str) -> Optional[str]:
+    """Build canonical web URL for a file based on type."""
     name_u = u(filename)
     if file_type == "note":
         return f"/notes/{name_u}"
@@ -746,6 +827,7 @@ def file_link_by_type(file_type: str, filename: str) -> Optional[str]:
     return None
 
 def get_public_uploads_for_user(user_id: int, limit: int = 12):
+    """Return recent public uploads for a specific user profile."""
     conn = get_db_connection()
     rows = conn.execute(
         """
@@ -761,6 +843,7 @@ def get_public_uploads_for_user(user_id: int, limit: int = 12):
     return [row for row in rows if file_exists_by_type(row["file_type"], row["filename"])]
 
 def get_recommended_public_files_for_user(user_id: int, limit: int = 18):
+    """Return recent public files from accounts followed by the user."""
     conn = get_db_connection()
     rows = conn.execute(
         """
@@ -779,6 +862,7 @@ def get_recommended_public_files_for_user(user_id: int, limit: int = 18):
     return [row for row in rows if file_exists_by_type(row["file_type"], row["filename"])]
 
 def follow_user(follower_user_id: int, target_user_id: int):
+    """Create a follow relationship while preventing self-follow."""
     if follower_user_id == target_user_id:
         raise HTTPException(status_code=400, detail="Cannot follow yourself")
     conn = get_db_connection()
@@ -793,6 +877,7 @@ def follow_user(follower_user_id: int, target_user_id: int):
     conn.close()
 
 def unfollow_user(follower_user_id: int, target_user_id: int):
+    """Remove a follow relationship if it exists."""
     conn = get_db_connection()
     conn.execute(
         "DELETE FROM follows WHERE follower_user_id = ? AND followed_user_id = ?",
@@ -802,12 +887,14 @@ def unfollow_user(follower_user_id: int, target_user_id: int):
     conn.close()
 
 def get_note_lock(filename: str):
+    """Fetch lock metadata for a note if present."""
     conn = get_db_connection()
     row = conn.execute("SELECT * FROM note_locks WHERE filename = ?", (filename,)).fetchone()
     conn.close()
     return row
 
 def set_note_lock(filename: str, password: str, owner_user_id: Optional[int]):
+    """Create or update a note lock and ownership binding."""
     conn = get_db_connection()
     conn.execute(
         """
@@ -829,28 +916,50 @@ def set_note_lock(filename: str, password: str, owner_user_id: Optional[int]):
     conn.close()
 
 def remove_note_lock(filename: str):
+    """Remove lock metadata from a note."""
     conn = get_db_connection()
     conn.execute("DELETE FROM note_locks WHERE filename = ?", (filename,))
     conn.commit()
     conn.close()
 
 def parse_unlocked_cookie(request: Request) -> set:
+    """Parse unlocked-note cookie into a set of unlocked filenames."""
     raw = request.cookies.get("unlocked_notes", "")
     return {item for item in raw.split("|") if item}
 
 def user_can_bypass_lock(user, lock_row) -> bool:
+    """Allow lock bypass for admins or original lock owners."""
     if not user:
         return False
     if user["role"] == "admin":
         return True
     return bool(lock_row and lock_row["owner_user_id"] == user["id"])
 
+def build_issue_report_template(user) -> str:
+    """Return a ready-to-send issue template for support messages."""
+    stamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    username = user["username"] if user else "unknown"
+    return (
+        "Bug report:\n"
+        "- Summary: \n"
+        "- Expected behavior: \n"
+        "- Actual behavior: \n"
+        "- Steps to reproduce: \n"
+        f"- Time observed: {stamp}\n"
+        "- Browser/OS: \n"
+        f"- Reporting user: {username}\n\n"
+        "Diagnostics:\n"
+        "[paste Support Checklist output]"
+    )
+
 init_auth_db()
 
 def thumbnail_path(video_name: str) -> Path:
+    """Return thumbnail path for a given video filename."""
     return config["thumbnails"] / f"{Path(video_name).stem}.jpg"
 
 def generate_video_thumbnail(video_name: str) -> Optional[Path]:
+    """Generate or reuse a JPEG thumbnail for a stored video."""
     video_file = config["videos"] / safe_name(video_name)
     if not video_file.exists():
         return None
@@ -889,6 +998,12 @@ COMMON_STYLE = """
     body.layout-focus .home-grid { grid-template-columns: 1fr; }
     body.layout-compact { font-size: 0.95em; }
     body.layout-compact .card { padding: 14px; margin-bottom: 14px; }
+    body.layout-custom {
+        max-width: var(--fp-custom-max-width, 1100px);
+        font-size: var(--fp-custom-font-scale, 1);
+    }
+    body.layout-custom .card { padding: var(--fp-custom-card-pad, 20px); }
+    body.layout-custom .home-grid { grid-template-columns: var(--fp-custom-home-cols, 2fr 1fr); }
     .nav-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
     .helper { color: #666; font-size: 0.85em; margin-top: 6px; }
     .notice-ok { color:#155724; background:#d4edda; padding:8px; border-radius:4px; }
@@ -902,6 +1017,12 @@ COMMON_STYLE = """
     .global-display-toolbar .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .global-display-toolbar select { padding: 6px 8px; border-radius: 4px; border: 1px solid #ddd; }
     .global-display-toolbar button { padding: 6px 10px; border: 0; border-radius: 4px; background: #6c757d; color: #fff; cursor: pointer; }
+    .global-display-toolbar .custom-row { display: none; margin-top: 8px; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .global-display-toolbar .custom-row label { font-size: 0.78em; display: flex; gap: 6px; align-items: center; }
+    .global-display-toolbar .custom-row input[type="range"] { width: 120px; }
+    .global-display-toolbar .custom-val { font-size: 0.78em; min-width: 42px; display: inline-block; text-align: right; }
+    .global-display-toolbar .preset-row { margin-top: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .global-display-toolbar .preset-row input { padding: 6px 8px; border-radius: 4px; border: 1px solid #ddd; }
     body.theme-dark .global-display-toolbar { background: rgba(25,25,25,0.92); border-color: #3c3c3c; }
     body.theme-dark .global-display-toolbar select { background: #181818; color: #eee; border-color: #3c3c3c; }
     .btn { padding: 8px 16px; border-radius: 4px; text-decoration: none; font-weight: bold; cursor: pointer; border: none; display: inline-block; font-size: 0.9em; }
@@ -968,33 +1089,204 @@ COMMON_STYLE = """
 </style>
 <script>
     (function() {
+        // Persisted display preference keys.
         const themeKey = 'fp_theme';
         const layoutKey = 'fp_layout';
+        const customKey = 'fp_layout_custom';
+        const presetsKey = 'fp_layout_presets';
 
         function applyView(theme, layout) {
+            // Toggle body-level classes so all pages inherit the same visual mode.
             document.body.classList.toggle('theme-dark', theme === 'dark');
-            document.body.classList.remove('layout-wide', 'layout-focus', 'layout-compact');
+            document.body.classList.remove('layout-wide', 'layout-focus', 'layout-compact', 'layout-custom');
             if (layout === 'wide') document.body.classList.add('layout-wide');
             if (layout === 'focus') document.body.classList.add('layout-focus');
             if (layout === 'compact') document.body.classList.add('layout-compact');
+            if (layout === 'custom') document.body.classList.add('layout-custom');
+        }
+
+        function readCustomSettings() {
+            const fallback = { width: 1100, fontScale: 100, cardPad: 20, leftRatio: 67 };
+            try {
+                const parsed = JSON.parse(localStorage.getItem(customKey) || '{}');
+                return {
+                    width: Number(parsed.width) || fallback.width,
+                    fontScale: Number(parsed.fontScale) || fallback.fontScale,
+                    cardPad: Number(parsed.cardPad) || fallback.cardPad,
+                    leftRatio: Number(parsed.leftRatio) || fallback.leftRatio,
+                };
+            } catch (_) {
+                return fallback;
+            }
+        }
+
+        function applyCustomSettings(settings) {
+            const rightRatio = Math.max(20, 100 - settings.leftRatio);
+            document.body.style.setProperty('--fp-custom-max-width', `${settings.width}px`);
+            document.body.style.setProperty('--fp-custom-font-scale', `${settings.fontScale / 100}`);
+            document.body.style.setProperty('--fp-custom-card-pad', `${settings.cardPad}px`);
+            document.body.style.setProperty('--fp-custom-home-cols', `${settings.leftRatio}fr ${rightRatio}fr`);
+        }
+
+        function readPresets() {
+            try {
+                const parsed = JSON.parse(localStorage.getItem(presetsKey) || '{}');
+                if (parsed && typeof parsed === 'object') return parsed;
+            } catch (_) {}
+            return {};
+        }
+
+        function writePresets(presets) {
+            localStorage.setItem(presetsKey, JSON.stringify(presets));
         }
 
         function buildToolbar() {
+            // Inject one global toolbar per page load.
             if (document.getElementById('globalDisplayToolbar')) return;
             const wrapper = document.createElement('div');
             wrapper.className = 'global-display-toolbar';
             wrapper.id = 'globalDisplayToolbar';
-            wrapper.innerHTML = "<div class='row'><strong style='font-size:0.85em;'>Display</strong><label style='font-size:0.8em;'>Theme <select id='globalThemeSelect'><option value='light'>Light</option><option value='dark'>Dark</option></select></label><label style='font-size:0.8em;'>Layout <select id='globalLayoutSelect'><option value='standard'>Standard</option><option value='wide'>Wide</option><option value='focus'>Focus</option><option value='compact'>Compact</option></select></label><button id='globalDisplayResetBtn' type='button'>Reset</button></div>";
+            wrapper.innerHTML = `
+                <div class='row'>
+                    <strong style='font-size:0.85em;'>Display</strong>
+                    <label style='font-size:0.8em;'>Theme
+                        <select id='globalThemeSelect'>
+                            <option value='light'>Light</option>
+                            <option value='dark'>Dark</option>
+                        </select>
+                    </label>
+                    <label style='font-size:0.8em;'>Layout
+                        <select id='globalLayoutSelect'>
+                            <option value='standard'>Standard</option>
+                            <option value='wide'>Wide</option>
+                            <option value='focus'>Focus</option>
+                            <option value='compact'>Compact</option>
+                            <option value='custom'>Custom</option>
+                        </select>
+                    </label>
+                    <button id='globalDisplayResetBtn' type='button'>Reset</button>
+                </div>
+                <div id='globalCustomLayoutRow' class='custom-row'>
+                    <label>Width
+                        <input id='customWidthRange' type='range' min='900' max='1600' step='10'>
+                        <span id='customWidthVal' class='custom-val'></span>
+                    </label>
+                    <label>Text
+                        <input id='customFontRange' type='range' min='90' max='115' step='1'>
+                        <span id='customFontVal' class='custom-val'></span>
+                    </label>
+                    <label>Card Padding
+                        <input id='customPadRange' type='range' min='10' max='30' step='1'>
+                        <span id='customPadVal' class='custom-val'></span>
+                    </label>
+                    <label>Main Column
+                        <input id='customColsRange' type='range' min='55' max='80' step='1'>
+                        <span id='customColsVal' class='custom-val'></span>
+                    </label>
+                </div>
+                <div class='preset-row'>
+                    <label style='font-size:0.8em;'>Preset
+                        <select id='globalPresetSelect'>
+                            <option value=''>Saved presets</option>
+                        </select>
+                    </label>
+                    <input id='globalPresetName' type='text' placeholder='Preset name'>
+                    <button id='globalPresetSaveBtn' type='button'>Save Preset</button>
+                    <button id='globalPresetDeleteBtn' type='button'>Delete Preset</button>
+                </div>
+            `;
             document.body.insertBefore(wrapper, document.body.firstChild);
 
             const themeSelect = document.getElementById('globalThemeSelect');
             const layoutSelect = document.getElementById('globalLayoutSelect');
             const resetBtn = document.getElementById('globalDisplayResetBtn');
+            const customRow = document.getElementById('globalCustomLayoutRow');
+            const widthRange = document.getElementById('customWidthRange');
+            const fontRange = document.getElementById('customFontRange');
+            const padRange = document.getElementById('customPadRange');
+            const colsRange = document.getElementById('customColsRange');
+            const widthVal = document.getElementById('customWidthVal');
+            const fontVal = document.getElementById('customFontVal');
+            const padVal = document.getElementById('customPadVal');
+            const colsVal = document.getElementById('customColsVal');
+            const presetSelect = document.getElementById('globalPresetSelect');
+            const presetNameInput = document.getElementById('globalPresetName');
+            const presetSaveBtn = document.getElementById('globalPresetSaveBtn');
+            const presetDeleteBtn = document.getElementById('globalPresetDeleteBtn');
+
             const savedTheme = localStorage.getItem(themeKey) || 'light';
             const savedLayout = localStorage.getItem(layoutKey) || 'standard';
+            let custom = readCustomSettings();
+
+            function syncCustomUi() {
+                widthRange.value = String(custom.width);
+                fontRange.value = String(custom.fontScale);
+                padRange.value = String(custom.cardPad);
+                colsRange.value = String(custom.leftRatio);
+                widthVal.textContent = `${custom.width}px`;
+                fontVal.textContent = `${custom.fontScale}%`;
+                padVal.textContent = `${custom.cardPad}px`;
+                colsVal.textContent = `${custom.leftRatio}%`;
+            }
+
+            function saveAndApplyCustom() {
+                // Keep custom sliders persistent and immediately reflected in CSS vars.
+                localStorage.setItem(customKey, JSON.stringify(custom));
+                applyCustomSettings(custom);
+            }
+
+            function captureCurrentPreset() {
+                return {
+                    theme: themeSelect.value,
+                    layout: layoutSelect.value,
+                    custom: { ...custom },
+                };
+            }
+
+            function refreshPresetSelect(selectedName = '') {
+                const presets = readPresets();
+                const names = Object.keys(presets).sort((a, b) => a.localeCompare(b));
+                presetSelect.innerHTML = "<option value=''>Saved presets</option>";
+                for (const name of names) {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    opt.textContent = name;
+                    presetSelect.appendChild(opt);
+                }
+                if (selectedName && presets[selectedName]) presetSelect.value = selectedName;
+            }
+
+            function applyPreset(name) {
+                // Presets bundle theme, layout, and custom slider values.
+                const presets = readPresets();
+                const preset = presets[name];
+                if (!preset) return;
+                if (preset.custom && typeof preset.custom === 'object') {
+                    custom = {
+                        width: Number(preset.custom.width) || custom.width,
+                        fontScale: Number(preset.custom.fontScale) || custom.fontScale,
+                        cardPad: Number(preset.custom.cardPad) || custom.cardPad,
+                        leftRatio: Number(preset.custom.leftRatio) || custom.leftRatio,
+                    };
+                    localStorage.setItem(customKey, JSON.stringify(custom));
+                }
+                themeSelect.value = preset.theme || 'light';
+                layoutSelect.value = preset.layout || 'standard';
+                localStorage.setItem(themeKey, themeSelect.value);
+                localStorage.setItem(layoutKey, layoutSelect.value);
+                applyCustomSettings(custom);
+                syncCustomUi();
+                customRow.style.display = layoutSelect.value === 'custom' ? 'flex' : 'none';
+                applyView(themeSelect.value, layoutSelect.value);
+            }
+
             themeSelect.value = savedTheme;
             layoutSelect.value = savedLayout;
             applyView(savedTheme, savedLayout);
+            applyCustomSettings(custom);
+            syncCustomUi();
+            customRow.style.display = savedLayout === 'custom' ? 'flex' : 'none';
+            refreshPresetSelect();
 
             themeSelect.addEventListener('change', function() {
                 localStorage.setItem(themeKey, themeSelect.value);
@@ -1003,17 +1295,70 @@ COMMON_STYLE = """
             layoutSelect.addEventListener('change', function() {
                 localStorage.setItem(layoutKey, layoutSelect.value);
                 applyView(themeSelect.value, layoutSelect.value);
+                customRow.style.display = layoutSelect.value === 'custom' ? 'flex' : 'none';
             });
+
+            widthRange.addEventListener('input', function() {
+                custom.width = Number(widthRange.value);
+                saveAndApplyCustom();
+                syncCustomUi();
+            });
+            fontRange.addEventListener('input', function() {
+                custom.fontScale = Number(fontRange.value);
+                saveAndApplyCustom();
+                syncCustomUi();
+            });
+            padRange.addEventListener('input', function() {
+                custom.cardPad = Number(padRange.value);
+                saveAndApplyCustom();
+                syncCustomUi();
+            });
+            colsRange.addEventListener('input', function() {
+                custom.leftRatio = Number(colsRange.value);
+                saveAndApplyCustom();
+                syncCustomUi();
+            });
+
             resetBtn.addEventListener('click', function() {
                 localStorage.setItem(themeKey, 'light');
                 localStorage.setItem(layoutKey, 'standard');
+                custom = { width: 1100, fontScale: 100, cardPad: 20, leftRatio: 67 };
+                localStorage.setItem(customKey, JSON.stringify(custom));
                 themeSelect.value = 'light';
                 layoutSelect.value = 'standard';
+                customRow.style.display = 'none';
+                syncCustomUi();
+                applyCustomSettings(custom);
                 applyView('light', 'standard');
+            });
+
+            presetSaveBtn.addEventListener('click', function() {
+                const rawName = (presetNameInput.value || '').trim();
+                const name = rawName || `Preset ${new Date().toLocaleString()}`;
+                const presets = readPresets();
+                presets[name] = captureCurrentPreset();
+                writePresets(presets);
+                refreshPresetSelect(name);
+                presetNameInput.value = '';
+            });
+
+            presetDeleteBtn.addEventListener('click', function() {
+                const name = presetSelect.value;
+                if (!name) return;
+                const presets = readPresets();
+                delete presets[name];
+                writePresets(presets);
+                refreshPresetSelect();
+            });
+
+            presetSelect.addEventListener('change', function() {
+                if (!presetSelect.value) return;
+                applyPreset(presetSelect.value);
             });
         }
 
         document.addEventListener('DOMContentLoaded', function() {
+            // Apply saved display settings before users interact with page content.
             try {
                 const savedTheme = localStorage.getItem(themeKey) || 'light';
                 const savedLayout = localStorage.getItem(layoutKey) || 'standard';
@@ -1028,8 +1373,10 @@ COMMON_STYLE = """
 """
 
 # --- 4. ROUTES ---
+# Authentication and account lifecycle routes
 @app.get("/auth/register", response_class=HTMLResponse)
 def register_page(request: Request):
+    """Render the web registration page with CSRF protection."""
     csrf_token = get_or_create_csrf_token(request)
     page = f"""
     <html><head>{COMMON_STYLE}</head><body>
@@ -1052,6 +1399,7 @@ def register_page(request: Request):
 
 @app.post("/auth/register")
 def register_route(request: Request, username: str = Form(...), password: str = Form(...), csrf_token: str = Form("")):
+    """Create a new account from form input and sign the user in."""
     validate_csrf(request, csrf_token)
     clean_user = username.strip().lower()
     role = "admin" if get_user_count() == 0 else "user"
@@ -1063,6 +1411,7 @@ def register_route(request: Request, username: str = Form(...), password: str = 
 
 @app.get("/auth/login", response_class=HTMLResponse)
 def login_page(request: Request):
+    """Render the web login page with CSRF token injection."""
     csrf_token = get_or_create_csrf_token(request)
     page = f"""
     <html><head>{COMMON_STYLE}</head><body>
@@ -1084,6 +1433,7 @@ def login_page(request: Request):
 
 @app.post("/auth/login")
 def login_route(request: Request, username: str = Form(...), password: str = Form(...), csrf_token: str = Form("")):
+    """Authenticate user credentials and issue an auth session cookie."""
     validate_csrf(request, csrf_token)
     clean_user = username.strip().lower()
     conn = get_db_connection()
@@ -1098,6 +1448,7 @@ def login_route(request: Request, username: str = Form(...), password: str = For
 
 @app.get("/auth/logout")
 def logout_route(request: Request):
+    """Clear the active auth session and redirect to home."""
     token = request.cookies.get("auth_token")
     if token:
         clear_session(token)
@@ -1107,6 +1458,7 @@ def logout_route(request: Request):
 
 @app.get("/account", response_class=HTMLResponse)
 def account_page(request: Request, status: Optional[str] = None):
+    """Render account security page and password change form."""
     user = get_current_user(request)
     if not user:
         return RedirectResponse("/auth/login", status_code=303)
@@ -1156,6 +1508,7 @@ def account_password_route(
     new_password: str = Form(...),
     csrf_token: str = Form(""),
 ):
+    """Change the signed-in user's password after validating current password."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if not user:
@@ -1174,6 +1527,7 @@ def account_password_route(
 
 @app.get("/profile", response_class=HTMLResponse)
 def profile_page(request: Request, status: Optional[str] = None, follow_status: Optional[str] = None):
+    """Render signed-in user's profile, follow lists, and inbox summary."""
     user = get_current_user(request)
     if not user:
         return RedirectResponse("/auth/login", status_code=303)
@@ -1270,6 +1624,7 @@ def profile_page(request: Request, status: Optional[str] = None, follow_status: 
 
 @app.post("/profile/public-name")
 def update_public_name_route(request: Request, public_name: str = Form(...), csrf_token: str = Form("")):
+    """Update current user's public profile name."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if not user:
@@ -1285,6 +1640,7 @@ def update_public_name_route(request: Request, public_name: str = Form(...), csr
 
 @app.get("/u/{username}", response_class=HTMLResponse)
 def public_user_profile(request: Request, username: str):
+    """Render a public profile page with follow controls and public uploads."""
     viewer = get_current_user(request)
     csrf_token = get_or_create_csrf_token(request)
     clean_user = username.strip().lower()
@@ -1367,6 +1723,7 @@ def public_user_profile(request: Request, username: str):
 
 @app.get("/admin/users", response_class=HTMLResponse)
 def admin_users_page(request: Request, status: Optional[str] = None):
+    """Render admin user-management table and account creation form."""
     user = get_current_user(request)
     if not user or user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -1410,6 +1767,7 @@ def admin_users_page(request: Request, status: Optional[str] = None):
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_control_page(request: Request):
+    """Render top-level admin dashboard with platform summaries and shortcuts."""
     user = get_current_user(request)
     if not user or user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -1472,6 +1830,7 @@ def admin_create_user_route(
     make_admin: Optional[str] = Form(None),
     csrf_token: str = Form(""),
 ):
+    """Allow admins to create user/admin accounts from web control panel."""
     validate_csrf(request, csrf_token)
     current = get_current_user(request)
     if not current or current["role"] != "admin":
@@ -1486,6 +1845,7 @@ def admin_create_user_route(
 
 @app.post("/api/auth/register")
 def api_register(username: str = Form(...), password: str = Form(...)):
+    """Register a user account via API and return an auth token."""
     clean_user = username.strip().lower()
     role = "admin" if get_user_count() == 0 else "user"
     user_row = create_user_account(clean_user, password, role=role, public_name=clean_user)
@@ -1500,6 +1860,7 @@ def api_admin_create_user(
     role: str = Form("user"),
     public_name: str = Form(""),
 ):
+    """Create a user via admin API endpoint using bearer-token auth."""
     user, _ = get_api_user(request)
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -1517,6 +1878,7 @@ def api_admin_create_user(
 
 @app.post("/api/auth/login")
 def api_login(username: str = Form(...), password: str = Form(...)):
+    """Authenticate via API and return token plus user profile."""
     clean_user = username.strip().lower()
     conn = get_db_connection()
     user = conn.execute("SELECT id, username, public_name, role, password_hash FROM users WHERE username = ?", (clean_user,)).fetchone()
@@ -1528,6 +1890,7 @@ def api_login(username: str = Form(...), password: str = Form(...)):
 
 @app.get("/api/me")
 def api_me(request: Request):
+    """Return authenticated user's profile and unread counters."""
     user, _ = get_api_user(request)
     return {
         "id": user["id"],
@@ -1540,6 +1903,7 @@ def api_me(request: Request):
 
 @app.get("/api/notes")
 def api_list_notes(request: Request):
+    """List visible notes and lock metadata for authenticated API caller."""
     user, _ = get_api_user(request)
     note_files = sorted([f.name for f in config["notes"].glob("*") if f.suffix in [".md", ".txt"]])
     items = []
@@ -1551,6 +1915,7 @@ def api_list_notes(request: Request):
 
 @app.get("/api/notes/{filename}")
 def api_get_note(request: Request, filename: str, note_password: Optional[str] = None):
+    """Return a note body through API, enforcing lock checks when needed."""
     user, _ = get_api_user(request)
     name = ensure_safe_filename(filename)
     file_path = config["notes"] / name
@@ -1571,6 +1936,7 @@ def api_create_note(
     lock_password: str = Form(""),
     private_note: str = Form(""),
 ):
+    """Create a new note via API with optional locking and privacy settings."""
     user, _ = get_api_user(request)
     clean_title = title.strip()
     if not clean_title:
@@ -1590,6 +1956,7 @@ def api_create_note(
 
 @app.get("/api/messages")
 def api_messages(request: Request, mark_read: bool = True):
+    """Return inbox/sent message history and optionally mark inbox as read."""
     user, _ = get_api_user(request)
     conn = get_db_connection()
     unread_before = conn.execute(
@@ -1637,6 +2004,7 @@ def api_messages(request: Request, mark_read: bool = True):
 
 @app.post("/api/messages")
 def api_send_message(request: Request, recipient_username: str = Form(...), message_text: str = Form(...)):
+    """Send a direct message via API from authenticated user to recipient."""
     user, _ = get_api_user(request)
     target_name = recipient_username.strip().lower()
     body = message_text.strip()
@@ -1665,7 +2033,13 @@ def api_send_message(request: Request, recipient_username: str = Form(...), mess
     return {"id": message_id, "to": recipient["username"], "text": body}
 
 @app.get("/messages", response_class=HTMLResponse)
-def messages_page(request: Request):
+def messages_page(
+    request: Request,
+    compose: Optional[str] = None,
+    recipient_username: Optional[str] = None,
+    message_text: Optional[str] = None,
+):
+    """Render messaging UI with send form, inbox, and sent history."""
     user = get_current_user(request)
     if not user:
         return RedirectResponse("/auth/login", status_code=303)
@@ -1677,7 +2051,7 @@ def messages_page(request: Request):
     )
     conn.commit()
     recipients = conn.execute(
-        "SELECT id, username FROM users WHERE id != ? ORDER BY username ASC",
+        "SELECT id, username, role FROM users WHERE id != ? ORDER BY username ASC",
         (user["id"],),
     ).fetchall()
     inbox = conn.execute(
@@ -1702,9 +2076,23 @@ def messages_page(request: Request):
     ).fetchall()
     conn.close()
 
+    admin_recipient = next((row["username"] for row in recipients if row["role"] == "admin"), "")
+    selected_recipient = (recipient_username or "").strip().lower()
+    if compose == "issue" and not selected_recipient:
+        selected_recipient = admin_recipient
+
+    prefilled_message = (message_text or "").strip()
+    if compose == "issue" and not prefilled_message:
+        prefilled_message = build_issue_report_template(user)
+
     recipient_options = "".join([
-        f"<option value='{h(r['username'])}'>{h(r['username'])}</option>" for r in recipients
+        f"<option value='{h(r['username'])}'{' selected' if r['username'] == selected_recipient else ''}>{h(r['username'])}{' (admin)' if r['role'] == 'admin' else ''}</option>"
+        for r in recipients
     ])
+
+    issue_helper = ""
+    if compose == "issue":
+        issue_helper = "<p class='helper'>Issue mode: admin recipient is preselected and a report template is prefilled. Add details and click Send.</p>"
     inbox_html = "".join([
         f"<div class='note-item'><div><strong>From:</strong> {h(m['sender_username'])}<br><span>{h(m['message_text'])}</span><br><small>{h(m['created_at'])}</small></div></div>"
         for m in inbox
@@ -1720,13 +2108,14 @@ def messages_page(request: Request):
     <h1>Messages</h1>
     <div class='card'>
         <h3>Send Message</h3>
+        {issue_helper}
         <form action='/messages/send' method='post' style='flex-wrap:wrap;'>
             <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
             <select name='recipient_username' required style='padding:10px;border:1px solid #ddd;border-radius:4px;'>
                 <option value=''>Select recipient</option>
                 {recipient_options}
             </select>
-            <input type='text' name='message_text' placeholder='Write a message...' style='flex-grow:1;' required>
+            <textarea name='message_text' placeholder='Write a message...' style='flex-grow:1;min-height:120px;' required>{h(prefilled_message)}</textarea>
             <button type='submit' class='btn btn-primary'>Send</button>
         </form>
     </div>
@@ -1745,6 +2134,7 @@ def send_message_route(
     message_text: str = Form(...),
     csrf_token: str = Form(""),
 ):
+    """Handle web message submission and persist message in database."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if not user:
@@ -1784,6 +2174,7 @@ def follow_route(
     next_path: str = Form("/"),
     csrf_token: str = Form(""),
 ):
+    """Create follow relationship from web form and redirect to caller page."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if not user:
@@ -1812,6 +2203,7 @@ def unfollow_route(
     next_path: str = Form("/"),
     csrf_token: str = Form(""),
 ):
+    """Remove follow relationship from web form and redirect to caller page."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if not user:
@@ -1831,6 +2223,7 @@ def unfollow_route(
 
 @app.get("/notifications", response_class=HTMLResponse)
 def notifications_page(request: Request):
+    """Render notifications page and mark unread notifications as read."""
     user = get_current_user(request)
     if not user:
         return RedirectResponse("/auth/login", status_code=303)
@@ -1868,6 +2261,7 @@ def notifications_page(request: Request):
     response.set_cookie("csrf_token", csrf_token, samesite="lax")
     return response
 
+# Main web home/dashboard route
 @app.get("/", response_class=HTMLResponse)
 def web_home(
     request: Request,
@@ -1881,6 +2275,7 @@ def web_home(
     follow_status: Optional[str] = None,
     data_status: Optional[str] = None,
 ):
+    """Render the main dashboard aggregating uploads, discovery, and social features."""
     csrf_token = get_or_create_csrf_token(request)
     user = get_current_user(request)
     setup_checks = get_setup_checks()
@@ -1894,7 +2289,7 @@ def web_home(
             admin_link = "<a href='/admin' class='btn btn-secondary'>Admin</a>"
         msg_label = f"Messages ({unread_count})" if unread_count else "Messages"
         notif_label = f"Notifications ({unread_notifications})" if unread_notifications else "Notifications"
-        auth_html = f"<div class='card' style='display:flex;justify-content:space-between;align-items:center;'><div>Signed in as <strong>{h(display_name(user))}</strong> <small>@{h(user['username'])}</small> ({h(user['role'])})</div><div style='display:flex;gap:8px;'><a href='/profile' class='btn btn-secondary'>Profile</a><a href='/notifications' class='btn btn-secondary'>{h(notif_label)}</a><a href='/messages' class='btn btn-secondary'>{h(msg_label)}</a><a href='/account' class='btn btn-secondary'>Security</a>{admin_link}<a href='/auth/logout' class='btn btn-secondary'>Logout</a></div></div>"
+        auth_html = f"<div class='card' style='display:flex;justify-content:space-between;align-items:center;'><div>Signed in as <strong>{h(display_name(user))}</strong> <small>@{h(user['username'])}</small> ({h(user['role'])})</div><div style='display:flex;gap:8px;'><a href='/profile' class='btn btn-secondary'>Profile</a><a href='/notifications' class='btn btn-secondary'>{h(notif_label)}</a><a href='/messages?compose=issue' class='btn btn-danger'>Report Issue</a><a href='/messages' class='btn btn-secondary'>{h(msg_label)}</a><a href='/account' class='btn btn-secondary'>Security</a>{admin_link}<a href='/auth/logout' class='btn btn-secondary'>Logout</a></div></div>"
     else:
         auth_html = "<div class='card' style='display:flex;justify-content:space-between;align-items:center;'><div>Browsing as guest</div><div style='display:flex;gap:8px;'><a href='/auth/login' class='btn btn-secondary'>Login</a><a href='/auth/register' class='btn btn-primary'>Register</a></div></div>"
 
@@ -2135,7 +2530,7 @@ def web_home(
         unread_count = get_unread_message_count(user["id"])
         conn = get_db_connection()
         recipients = conn.execute(
-            "SELECT username FROM users WHERE id != ? ORDER BY username ASC",
+            "SELECT username, role FROM users WHERE id != ? ORDER BY username ASC",
             (user["id"],),
         ).fetchall()
         recent_inbox = conn.execute(
@@ -2152,7 +2547,7 @@ def web_home(
         conn.close()
 
         recipient_options = "".join([
-            f"<option value='{h(r['username'])}'>{h(r['username'])}</option>" for r in recipients
+            f"<option value='{h(r['username'])}'>{h(r['username'])}{' (admin)' if r['role'] == 'admin' else ''}</option>" for r in recipients
         ])
         recent_html = "".join([
             f"<div class='chat-item'><div class='chat-meta'>From {h(msg['sender_username'])} · {h(msg['created_at'])}</div><div>{h(msg['message_text'])}</div></div>"
@@ -2172,7 +2567,7 @@ def web_home(
                 <button type='submit' class='btn btn-primary'>Send</button>
             </form>
             <div class='chat-list'>{recent_html}</div>
-            <div style='margin-top:10px;'><a href='/messages' class='btn btn-secondary'>Open Full Chat</a></div>
+            <div style='margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;'><a href='/messages' class='btn btn-secondary'>Open Full Chat</a><a href='/messages?compose=issue' class='btn btn-danger'>Report Issue</a></div>
         </div>
         """
     else:
@@ -2278,12 +2673,14 @@ def web_home(
 
     page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{actions_html}{text_search_html}{yt_search_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body><script>
     (function() {{
+        // Lightweight polling client for async YouTube imports.
         const progressWrap = document.getElementById('ytProgressWrap');
         const progressBar = document.getElementById('ytProgressBar');
         const progressLabel = document.getElementById('ytProgressLabel');
         const forms = Array.from(document.querySelectorAll("form[action='/videos/import-youtube']"));
 
         async function startImport(form) {{
+            // Start job, then poll progress endpoint until completion/error.
             const formData = new FormData(form);
             const ytQ = formData.get('yt_q') || '';
             progressWrap.style.display = 'block';
@@ -2345,6 +2742,7 @@ def import_text_route(
     private_upload: Optional[str] = Form(None),
     csrf_token: str = Form(""),
 ):
+    """Import a selected public text into notes and apply visibility metadata."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if private_upload and not user:
@@ -2366,6 +2764,7 @@ def import_text_route(
 
 @app.get("/notes/{filename}", response_class=HTMLResponse)
 def view_note(request: Request, filename: str, edit: bool = False):
+    """Render a note viewer/editor page, including lock-unlock flow."""
     name = ensure_safe_filename(filename)
     csrf_token = get_or_create_csrf_token(request)
     user = get_current_user(request)
@@ -2411,6 +2810,7 @@ def view_note(request: Request, filename: str, edit: bool = False):
 
 @app.post("/notes/{filename}/unlock")
 def unlock_note_route(request: Request, filename: str, note_password: str = Form(...), csrf_token: str = Form("")):
+    """Validate note password and store unlocked state in cookie."""
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
     lock_row = get_note_lock(name)
@@ -2426,6 +2826,7 @@ def unlock_note_route(request: Request, filename: str, note_password: str = Form
 
 @app.get("/datasets/{filename}/full", response_class=HTMLResponse)
 def view_full_dataset(request: Request, filename: str):
+    """Render full dataset preview table for authorized viewers."""
     name = ensure_safe_filename(filename)
     user = get_current_user(request)
     if not file_visible_to_user("dataset", name, user):
@@ -2456,6 +2857,7 @@ def view_full_dataset(request: Request, filename: str):
 
 @app.get("/datasets/{filename}/edit", response_class=HTMLResponse)
 def edit_dataset_page(request: Request, filename: str, status: Optional[str] = None):
+    """Render raw dataset editor with validation/save status messages."""
     name = ensure_safe_filename(filename)
     user = get_current_user(request)
     if not file_visible_to_user("dataset", name, user):
@@ -2494,6 +2896,7 @@ def edit_dataset_page(request: Request, filename: str, status: Optional[str] = N
 
 @app.post("/datasets/{filename}/save")
 def save_dataset_route(request: Request, filename: str, content: str = Form(...), csrf_token: str = Form("")):
+    """Validate and save edited dataset content back to disk."""
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
     user = get_current_user(request)
@@ -2511,6 +2914,7 @@ def save_dataset_route(request: Request, filename: str, content: str = Form(...)
 
 @app.post("/datasets/{filename}/delete")
 def delete_dataset_route(request: Request, filename: str, csrf_token: str = Form("")):
+    """Delete a dataset and associated metadata record."""
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
     user = get_current_user(request)
@@ -2525,6 +2929,7 @@ def delete_dataset_route(request: Request, filename: str, csrf_token: str = Form
 
 @app.post("/notes/{filename}/save")
 def save_note_route(request: Request, filename: str, content: str = Form(...), csrf_token: str = Form("")):
+    """Save note edits while enforcing lock access rules."""
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
     user = get_current_user(request)
@@ -2538,6 +2943,7 @@ def save_note_route(request: Request, filename: str, content: str = Form(...), c
 
 @app.post("/notes/{filename}/delete")
 def delete_note_route(request: Request, filename: str, csrf_token: str = Form("")):
+    """Delete a note file and remove any lock metadata."""
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
     user = get_current_user(request)
@@ -2557,6 +2963,7 @@ def create_note_route(
     lock_password: str = Form(""),
     csrf_token: str = Form(""),
 ):
+    """Create a new note from dashboard form with optional lock/privacy."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     title = filename.strip()
@@ -2585,6 +2992,7 @@ async def import_dataset_route(
     private_upload: Optional[str] = Form(None),
     csrf_token: str = Form(""),
 ):
+    """Upload dataset file to storage and record ownership/visibility metadata."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if private_upload and not user:
@@ -2607,6 +3015,7 @@ async def import_video_route(
     private_upload: Optional[str] = Form(None),
     csrf_token: str = Form(""),
 ):
+    """Upload local video file, generate thumbnail, and save visibility metadata."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if private_upload and not user:
@@ -2631,6 +3040,7 @@ def import_youtube_video_route(
     private_upload: Optional[str] = Form(None),
     csrf_token: str = Form(""),
 ):
+    """Import YouTube video synchronously from form submission."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if private_upload and not user:
@@ -2652,6 +3062,7 @@ def start_youtube_import_route(
     private_upload: Optional[str] = Form(None),
     csrf_token: str = Form(""),
 ):
+    """Start asynchronous YouTube import job and return job identifier."""
     validate_csrf(request, csrf_token)
     user = get_current_user(request)
     if private_upload and not user:
@@ -2680,6 +3091,7 @@ def start_youtube_import_route(
 
 @app.get("/videos/import-youtube/progress/{job_id}")
 def youtube_import_progress_route(job_id: str):
+    """Return current status/progress for a background YouTube import job."""
     with YOUTUBE_IMPORT_JOBS_LOCK:
         job = YOUTUBE_IMPORT_JOBS.get(job_id)
     if not job:
@@ -2693,6 +3105,7 @@ def youtube_import_progress_route(job_id: str):
 
 @app.get("/videos/{filename}", response_class=HTMLResponse)
 def view_video(request: Request, filename: str):
+    """Render video player page with delete and volume controls."""
     name = ensure_safe_filename(filename)
     csrf_token = get_or_create_csrf_token(request)
     user = get_current_user(request)
@@ -2709,6 +3122,7 @@ def view_video(request: Request, filename: str):
 
 @app.post("/videos/{filename}/delete")
 def delete_video_route(request: Request, filename: str, csrf_token: str = Form("")):
+    """Delete a video file and its generated thumbnail."""
     validate_csrf(request, csrf_token)
     name = ensure_safe_filename(filename)
     video_file = config["videos"] / name
@@ -2720,6 +3134,7 @@ def delete_video_route(request: Request, filename: str, csrf_token: str = Form("
 
 @app.get("/videos/{filename}/stream")
 def stream_video(request: Request, filename: str):
+    """Stream a stored video file to authorized clients."""
     name = ensure_safe_filename(filename)
     request_user = get_current_user(request)
     video_file = config["videos"] / name
@@ -2731,6 +3146,7 @@ def stream_video(request: Request, filename: str):
 
 @app.get("/videos/{filename}/thumbnail")
 def video_thumbnail(request: Request, filename: str):
+    """Serve generated thumbnail or SVG fallback for a video."""
     name = ensure_safe_filename(filename)
     user = get_current_user(request)
     video_file = config["videos"] / name
