@@ -41,7 +41,7 @@ import concurrent.futures
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, List
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 import json
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile, Request
@@ -505,6 +505,121 @@ def render_news_rows_html(news_items: List[dict]) -> str:
             rows += f"<div class='note-item'><div><strong>{h(item['source'])}</strong><br><small>{h(item['title'])}</small></div></div>"
     return rows
 
+def autotempest_is_listing_link(link: str) -> bool:
+    """Return True when a URL looks like a real vehicle listing destination."""
+    try:
+        parsed = urlparse(link)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.netloc or "").lower()
+    if not host:
+        return False
+    if host.endswith("autotempest.com"):
+        return False
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    listing_signatures = (
+        "/vehicle/",
+        "/vehicledetail/",
+        "/itm/",
+        "/details/cars/",
+        "request=adlink",
+        "ad=",
+    )
+    haystack = f"{path}?{query}"
+    return any(sig in haystack for sig in listing_signatures)
+
+def normalize_space(value: str) -> str:
+    """Collapse whitespace for cleaner text extraction from HTML snippets."""
+    return re.sub(r"\s+", " ", (value or "")).strip()
+
+def extract_autotempest_listings(
+    make: str,
+    model: str,
+    zip_code: str,
+    radius: int,
+    max_price: Optional[int],
+    limit: int = 36,
+) -> List[dict]:
+    """Scrape listing links from AutoTempest search results with lightweight metadata extraction."""
+    clean_make = (make or "").strip().lower() or "toyota"
+    clean_model = (model or "").strip().lower() or "camry"
+    clean_zip = re.sub(r"[^0-9]", "", (zip_code or "").strip())[:5] or "30301"
+    clean_radius = int(radius) if str(radius).strip() else 50
+    clean_radius = max(10, min(500, clean_radius))
+    clean_max_price = None
+    if max_price is not None and str(max_price).strip():
+        clean_max_price = max(500, int(max_price))
+
+    params = {
+        "make": clean_make,
+        "model": clean_model,
+        "zip": clean_zip,
+        "radius": str(clean_radius),
+    }
+    if clean_max_price is not None:
+        params["maxprice"] = str(clean_max_price)
+
+    source_url = f"https://www.autotempest.com/results?{urlencode(params)}"
+    req = UrlRequest(source_url, headers={"User-Agent": "future-proof-notes/1.0"})
+    with urlopen(req, timeout=10) as response:
+        page_html = response.read().decode("utf-8", errors="replace")
+
+    listings = []
+    seen = set()
+    anchor_re = re.compile(r"<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+
+    for match in anchor_re.finditer(page_html):
+        href = html.unescape(match.group(1) or "").strip()
+        if not href:
+            continue
+        if href.startswith("/"):
+            href = f"https://www.autotempest.com{href}"
+        if not autotempest_is_listing_link(href):
+            continue
+
+        parsed = urlparse(href)
+        dedupe_key = f"{parsed.netloc.lower()}|{parsed.path}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        raw_title = re.sub(r"<[^>]+>", " ", match.group(2) or "")
+        title = normalize_space(html.unescape(raw_title))
+        if len(title) < 6:
+            continue
+
+        nearby = page_html[max(0, match.start() - 320): min(len(page_html), match.end() + 520)]
+        nearby_clean = normalize_space(re.sub(r"<[^>]+>", " ", nearby))
+
+        price_match = re.search(r"\$\s?[\d,]{2,}", nearby_clean)
+        miles_match = re.search(r"\b([\d,]{1,7})\s*mi\.?\b", nearby_clean, re.IGNORECASE)
+        location_match = re.search(r"\b([A-Za-z][A-Za-z .'-]+,\s?[A-Z]{2})\b", nearby_clean)
+        image_match = re.search(r"<img[^>]+src=[\"']([^\"']+)[\"']", nearby, re.IGNORECASE)
+
+        source_label = (parsed.netloc or "listing").lower().replace("www.", "")
+        image_url = html.unescape(image_match.group(1)).strip() if image_match else ""
+        if image_url.startswith("/"):
+            image_url = f"https://www.autotempest.com{image_url}"
+
+        listings.append(
+            {
+                "title": title,
+                "link": href,
+                "source": source_label,
+                "price": price_match.group(0).replace(" ", "") if price_match else "Price not shown",
+                "miles": f"{miles_match.group(1)} mi" if miles_match else "",
+                "location": location_match.group(1) if location_match else "",
+                "image": image_url,
+            }
+        )
+        if len(listings) >= limit:
+            break
+
+    return listings
+
 def h(value) -> str:
     """HTML-escape any value for safe interpolation in templates."""
     return html.escape(str(value), quote=True)
@@ -675,13 +790,35 @@ def init_auth_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS marketplace_listings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller_user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            location TEXT NOT NULL,
+            mileage INTEGER,
+            description TEXT,
+            image_url TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            is_sold INTEGER NOT NULL DEFAULT 0,
+            sold_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(seller_user_id) REFERENCES users(id)
+        )
+    ''')
     msg_cols = [row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
     user_cols = [row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    listing_cols = [row["name"] for row in conn.execute("PRAGMA table_info(marketplace_listings)").fetchall()]
     if "public_name" not in user_cols:
         conn.execute("ALTER TABLE users ADD COLUMN public_name TEXT")
         conn.execute("UPDATE users SET public_name = username WHERE public_name IS NULL OR trim(public_name) = ''")
     if "read_at" not in msg_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
+    if "is_sold" not in listing_cols:
+        conn.execute("ALTER TABLE marketplace_listings ADD COLUMN is_sold INTEGER NOT NULL DEFAULT 0")
+    if "sold_at" not in listing_cols:
+        conn.execute("ALTER TABLE marketplace_listings ADD COLUMN sold_at TEXT")
     conn.commit()
     conn.close()
 
@@ -830,6 +967,117 @@ def set_user_home_hidden_panels(user_id: int, hidden_panels: List[str]):
     conn.commit()
     conn.close()
 
+def normalize_marketplace_image_url(image_url: str) -> str:
+    """Normalize and validate optional image URL for marketplace listings."""
+    value = (image_url or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Image URL must be a valid http(s) URL")
+    return value
+
+def create_marketplace_listing(
+    seller_user_id: int,
+    title: str,
+    price: int,
+    location: str,
+    mileage: Optional[int],
+    description: str,
+    image_url: str,
+):
+    """Persist a user-created marketplace listing in the auth DB."""
+    clean_title = (title or "").strip()
+    clean_location = (location or "").strip()
+    clean_description = (description or "").strip()
+    clean_image_url = normalize_marketplace_image_url(image_url)
+
+    if len(clean_title) < 4 or len(clean_title) > 140:
+        raise HTTPException(status_code=400, detail="Title must be between 4 and 140 characters")
+    if len(clean_location) < 2 or len(clean_location) > 80:
+        raise HTTPException(status_code=400, detail="Location must be between 2 and 80 characters")
+
+    safe_price = max(100, min(int(price), 5_000_000))
+    safe_mileage = None
+    if mileage is not None and str(mileage).strip():
+        safe_mileage = max(0, min(int(mileage), 2_000_000))
+
+    if len(clean_description) > 2000:
+        raise HTTPException(status_code=400, detail="Description is too long")
+
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO marketplace_listings
+            (seller_user_id, title, price, location, mileage, description, image_url, is_active, is_sold, sold_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, NULL, ?)
+        """,
+        (
+            seller_user_id,
+            clean_title,
+            safe_price,
+            clean_location,
+            safe_mileage,
+            clean_description,
+            clean_image_url,
+            datetime.datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+def get_recent_marketplace_listings(limit: int = 40, sold_only: bool = False):
+    """Return newest active marketplace listings; optionally only sold listings."""
+    conn = get_db_connection()
+    sold_filter = 1 if sold_only else 0
+    rows = conn.execute(
+                """
+                SELECT
+                        marketplace_listings.id,
+                        marketplace_listings.seller_user_id,
+                        marketplace_listings.title,
+                        marketplace_listings.price,
+                        marketplace_listings.location,
+                        marketplace_listings.mileage,
+                        marketplace_listings.description,
+                        marketplace_listings.image_url,
+                        marketplace_listings.is_sold,
+                        marketplace_listings.sold_at,
+                        marketplace_listings.created_at,
+                        users.username AS seller_username,
+                        users.public_name AS seller_public_name
+                FROM marketplace_listings
+                JOIN users ON users.id = marketplace_listings.seller_user_id
+                WHERE marketplace_listings.is_active = 1
+                    AND marketplace_listings.is_sold = ?
+                ORDER BY marketplace_listings.id DESC
+                LIMIT ?
+                """,
+        (sold_filter, max(1, min(limit, 120))),
+    ).fetchall()
+    conn.close()
+    return rows
+
+def mark_marketplace_listing_sold(listing_id: int, seller_user_id: int):
+    """Mark one listing as sold if it belongs to the authenticated seller."""
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT id, is_sold FROM marketplace_listings WHERE id = ? AND seller_user_id = ? AND is_active = 1",
+        (listing_id, seller_user_id),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if row["is_sold"]:
+        conn.close()
+        return
+    conn.execute(
+        "UPDATE marketplace_listings SET is_sold = 1, sold_at = ? WHERE id = ?",
+        (datetime.datetime.utcnow().isoformat(), listing_id),
+    )
+    conn.commit()
+    conn.close()
+
 def submit_game_score(user_id: int, game_name: str, score: int):
     """Persist a user's score for a supported mini game."""
     if game_name not in GAME_TYPES:
@@ -941,8 +1189,9 @@ def notify_followers_public_upload(actor_user, file_type: str, filename: str):
     message = f"{actor_user['username']} uploaded a public {file_type}: {filename}"
     conn.executemany(
         """
-        INSERT INTO notifications (user_id, actor_user_id, file_type, filename, message_text, read_at, created_at)
-        VALUES (?, ?, ?, ?, ?, NULL, ?)
+        INSERT INTO notifications
+            (user_id, actor_user_id, file_type, filename, message_text, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         [
             (row["follower_user_id"], actor_user["id"], file_type, filename, message, created_at)
@@ -2508,6 +2757,235 @@ def latest_news_route(force: int = 0):
         "items": items,
     }
 
+@app.get("/marketplace", response_class=HTMLResponse)
+def marketplace_page(
+    request: Request,
+    make: str = "toyota",
+    model: str = "camry",
+    zip_code: str = "30301",
+    radius: int = 50,
+    max_price: Optional[int] = None,
+    mp_status: Optional[str] = None,
+):
+    """Render a Facebook-style marketplace view with local and AutoTempest listings."""
+    csrf_token = get_or_create_csrf_token(request)
+    user = get_current_user(request)
+    error_message = ""
+    web_listings = []
+    try:
+        web_listings = extract_autotempest_listings(make, model, zip_code, radius, max_price)
+    except Exception:
+        error_message = "Could not load AutoTempest listings right now. Please try again."
+
+    community_rows = get_recent_marketplace_listings(limit=48, sold_only=False)
+    sold_rows = get_recent_marketplace_listings(limit=48, sold_only=True)
+    community_cards_html = ""
+    for row in community_rows:
+        seller_name = (row["seller_public_name"] or "").strip() or row["seller_username"]
+        image_html = ""
+        if row["image_url"]:
+            image_html = f"<img class='video-thumb' src='{h(row['image_url'])}' alt='Listing image for {h(row['title'])}'>"
+        mileage_label = f"{int(row['mileage']):,} mi" if row["mileage"] is not None else ""
+        meta_bits = [bit for bit in [mileage_label, row["location"], row["created_at"][:10]] if bit]
+        meta_line = " · ".join(meta_bits)
+        description = (row["description"] or "").strip()
+        if len(description) > 140:
+            description = description[:137] + "..."
+        seller_actions = ""
+        if user and user["id"] == row["seller_user_id"]:
+            seller_actions = f"""
+            <form action='/marketplace/listings/{int(row['id'])}/sold' method='post' style='margin:0;'>
+                <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+                <button type='submit' class='btn btn-success'>Mark Sold</button>
+            </form>
+            """
+        community_cards_html += f"""
+        <div class='video-card'>
+            {image_html}
+            <div style='font-size:1.1em;font-weight:700;'>${int(row['price']):,}</div>
+            <div class='video-title'>{h(row['title'])}</div>
+            <div class='helper'>{h(meta_line)}</div>
+            <div class='helper' style='min-height:2.3em;'>{h(description)}</div>
+            <div class='video-actions'>
+                <a href='/u/{u(row['seller_username'])}' class='btn btn-secondary'>Seller: {h(seller_name)}</a>
+                <a href='/messages?recipient_username={u(row['seller_username'])}' class='btn btn-primary'>Message</a>
+                {seller_actions}
+            </div>
+        </div>
+        """
+
+    sold_cards_html = ""
+    for row in sold_rows:
+        seller_name = (row["seller_public_name"] or "").strip() or row["seller_username"]
+        image_html = ""
+        if row["image_url"]:
+            image_html = f"<img class='video-thumb' src='{h(row['image_url'])}' alt='Listing image for {h(row['title'])}'>"
+        sold_date = (row["sold_at"] or row["created_at"] or "")[:10]
+        mileage_label = f"{int(row['mileage']):,} mi" if row["mileage"] is not None else ""
+        meta_bits = [bit for bit in [mileage_label, row["location"], f"Sold {sold_date}" if sold_date else "Sold"] if bit]
+        meta_line = " · ".join(meta_bits)
+        sold_cards_html += f"""
+        <div class='video-card'>
+            {image_html}
+            <div style='font-size:1.1em;font-weight:700;'>${int(row['price']):,} <span class='helper' style='font-weight:600;'>(SOLD)</span></div>
+            <div class='video-title'>{h(row['title'])}</div>
+            <div class='helper'>{h(meta_line)}</div>
+            <div class='video-actions'>
+                <a href='/u/{u(row['seller_username'])}' class='btn btn-secondary'>Seller: {h(seller_name)}</a>
+            </div>
+        </div>
+        """
+
+    web_cards_html = ""
+    for row in web_listings:
+        image_html = ""
+        if row.get("image"):
+            image_html = f"<a href='{h(row['link'])}' target='_blank' rel='noopener'><img class='video-thumb' src='{h(row['image'])}' alt='Listing image for {h(row['title'])}'></a>"
+        meta_bits = [bit for bit in [row.get("price"), row.get("miles"), row.get("location")] if bit]
+        meta_line = " · ".join(meta_bits)
+        web_cards_html += f"""
+        <div class='video-card'>
+            {image_html}
+            <div style='font-size:1.1em;font-weight:700;'>{h(row['price'])}</div>
+            <div class='video-title'>{h(row['title'])}</div>
+            <div class='helper'>{h(meta_line)}</div>
+            <div class='video-actions'>
+                <span class='helper'>{h(row['source'])}</span>
+                <a href='{h(row['link'])}' target='_blank' rel='noopener' class='btn btn-primary'>Open Listing ↗</a>
+            </div>
+        </div>
+        """
+
+    if not community_cards_html:
+        community_cards_html = "<div class='card'><p>No local listings yet. Be the first to post one.</p></div>"
+    if not sold_cards_html:
+        sold_cards_html = "<div class='card'><p>No sold listings yet.</p></div>"
+    if not web_cards_html and not error_message:
+        web_cards_html = "<div class='card'><p>No AutoTempest listings were found for this search.</p></div>"
+
+    notice_lines = []
+    if mp_status == "created":
+        notice_lines.append("<div class='card notice-ok'>Your listing is live.</div>")
+    elif mp_status == "sold":
+        notice_lines.append("<div class='card notice-ok'>Listing marked as sold.</div>")
+    elif mp_status == "error":
+        notice_lines.append("<div class='card notice-bad'>Could not create listing. Check your input and try again.</div>")
+    if error_message:
+        notice_lines.append(f"<div class='card notice-bad'>{h(error_message)}</div>")
+    notice_html = "".join(notice_lines)
+
+    create_listing_html = ""
+    if user:
+        create_listing_html = f"""
+        <div class='card'>
+            <h2>Create Listing</h2>
+            <form action='/marketplace/listings/create' method='post' style='display:flex;gap:8px;flex-wrap:wrap;'>
+                <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
+                <input type='text' name='title' placeholder='Listing title (e.g., 2021 Camry SE)' style='flex:2;min-width:220px;' required>
+                <input type='number' name='price' min='100' max='5000000' step='100' placeholder='Price' style='width:130px;' required>
+                <input type='text' name='location' placeholder='City, ST' style='width:180px;' required>
+                <input type='number' name='mileage' min='0' max='2000000' step='100' placeholder='Mileage' style='width:120px;'>
+                <input type='text' name='image_url' placeholder='Image URL (optional)' style='flex:2;min-width:220px;'>
+                <textarea name='description' rows='2' placeholder='Description (optional)' style='flex:1 1 100%;'></textarea>
+                <button type='submit' class='btn btn-success'>Post Listing</button>
+            </form>
+        </div>
+        """
+    else:
+        create_listing_html = "<div class='card'><h2>Create Listing</h2><p>Sign in to post your own listing.</p><a href='/auth/login' class='btn btn-secondary'>Sign In</a></div>"
+
+    page = f"""
+    <html><head>{COMMON_STYLE}</head><body>
+    <a href='/'>← Back</a>
+    <h1>🛒 Marketplace</h1>
+    <div class='card'>
+        <h2>Browse Marketplace</h2>
+        <form action='/marketplace' method='get' style='display:flex;gap:8px;flex-wrap:wrap;'>
+            <input type='text' name='make' value='{h(make)}' placeholder='Make (e.g., toyota)' required>
+            <input type='text' name='model' value='{h(model)}' placeholder='Model (e.g., camry)' required>
+            <input type='text' name='zip_code' value='{h(zip_code)}' placeholder='ZIP code' required>
+            <input type='number' name='radius' value='{h(radius)}' min='10' max='500' step='5' placeholder='Radius'>
+            <input type='number' name='max_price' value='{h(max_price or "")}' min='500' step='500' placeholder='Max price'>
+            <button type='submit' class='btn btn-primary'>Search Auto Listings</button>
+        </form>
+        <div class='helper' style='margin-top:8px;'>Facebook-style feed: local community listings + live AutoTempest listings.</div>
+    </div>
+    {create_listing_html}
+    {notice_html}
+    <div class='card'>
+        <h2>Local Community Listings</h2>
+        <div class='video-grid'>
+            {community_cards_html}
+        </div>
+    </div>
+    <div class='card'>
+        <h2>Sold Listings</h2>
+        <div class='helper'>Listings sellers mark as sold stay visible here.</div>
+        <div class='video-grid'>
+            {sold_cards_html}
+        </div>
+    </div>
+    <div class='card'>
+        <h2>AutoTempest Listings</h2>
+        <div class='helper'>External listings scraped from AutoTempest based on your search filters.</div>
+    </div>
+    <div class='video-grid'>
+        {web_cards_html}
+    </div>
+    </body></html>
+    """
+
+    response = HTMLResponse(page)
+    response.set_cookie("csrf_token", csrf_token, samesite="lax")
+    return response
+
+@app.post("/marketplace/listings/create")
+def marketplace_create_listing_route(
+    request: Request,
+    csrf_token: str = Form(""),
+    title: str = Form(...),
+    price: int = Form(...),
+    location: str = Form(...),
+    mileage: Optional[int] = Form(None),
+    description: str = Form(""),
+    image_url: str = Form(""),
+):
+    """Create a user-owned marketplace listing and redirect back to marketplace."""
+    validate_csrf(request, csrf_token)
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/auth/login", status_code=303)
+    try:
+        create_marketplace_listing(
+            seller_user_id=user["id"],
+            title=title,
+            price=price,
+            location=location,
+            mileage=mileage,
+            description=description,
+            image_url=image_url,
+        )
+    except Exception:
+        return RedirectResponse("/marketplace?mp_status=error", status_code=303)
+    return RedirectResponse("/marketplace?mp_status=created", status_code=303)
+
+@app.post("/marketplace/listings/{listing_id}/sold")
+def marketplace_mark_sold_route(
+    listing_id: int,
+    request: Request,
+    csrf_token: str = Form(""),
+):
+    """Allow a seller to mark their own marketplace listing as sold."""
+    validate_csrf(request, csrf_token)
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse("/auth/login", status_code=303)
+    try:
+        mark_marketplace_listing_sold(listing_id, user["id"])
+    except Exception:
+        return RedirectResponse("/marketplace?mp_status=error", status_code=303)
+    return RedirectResponse("/marketplace?mp_status=sold", status_code=303)
+
 @app.post("/home/panels")
 def save_home_panel_preferences_route(
     request: Request,
@@ -2574,6 +3052,7 @@ def web_home(
     <div class='card home-toolbar-card'>
         <div class='nav-pills'>
             <a href='#uploads' class='btn btn-secondary'>Uploads</a>
+            <a href='/marketplace' class='btn btn-secondary'>Marketplace</a>
             <a href='#recommendations' class='btn btn-secondary'>Recommendations</a>
             <a href='#news' class='btn btn-secondary'>News</a>
             <a href='#notes' class='btn btn-secondary'>Notes</a>
