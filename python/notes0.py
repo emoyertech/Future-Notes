@@ -3,13 +3,15 @@ import os, re, sys, markdown2, subprocess, datetime, shutil
 import html, secrets
 import sqlite3, hashlib
 import io
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional, List
 from urllib.parse import quote, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 import json
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response, JSONResponse
 import pandas as pd
 
 # --- 1. INITIALIZATION ---
@@ -32,6 +34,8 @@ def setup():
 
 config = setup()
 app = FastAPI(title="Note & Data Hub")
+YOUTUBE_IMPORT_JOBS = {}
+YOUTUBE_IMPORT_JOBS_LOCK = threading.Lock()
 
 # --- 2. CORE LOGIC ---
 def parse_note(f: Path):
@@ -261,6 +265,99 @@ def import_youtube_video(video_url: str) -> str:
     filename = safe_name(file_path.name)
     generate_video_thumbnail(filename)
     return filename
+
+def import_youtube_video_with_progress(video_url: str, progress_callback=None) -> str:
+    yt_dlp_path = get_yt_dlp_path()
+    if not yt_dlp_path:
+        raise HTTPException(status_code=500, detail="yt-dlp is not installed")
+    normalized_url = normalize_youtube_url(video_url)
+
+    command = [
+        yt_dlp_path,
+        "--newline",
+        "--no-playlist",
+        "-f",
+        "mp4/best[ext=mp4]/best",
+        "--restrict-filenames",
+        "--paths",
+        str(config["videos"]),
+        "-o",
+        "%(title).120B_[%(id)s].%(ext)s",
+        "--print",
+        "after_move:filepath",
+        normalized_url,
+    ]
+
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if progress_callback:
+        progress_callback(1.0, "Starting download...")
+
+    output_lines = []
+    percent_pattern = re.compile(r"(\d+(?:\.\d+)?)%")
+    for raw_line in iter(proc.stdout.readline, ""):
+        line = raw_line.strip()
+        if not line:
+            continue
+        output_lines.append(line)
+        match = percent_pattern.search(line)
+        if match and progress_callback:
+            try:
+                progress_callback(float(match.group(1)), line)
+            except Exception:
+                pass
+
+    proc.wait()
+    if proc.returncode != 0:
+        detail = "\n".join(output_lines[-8:]).strip() or "Video download failed"
+        raise HTTPException(status_code=400, detail=detail)
+
+    file_path = None
+    for line in reversed(output_lines):
+        candidate = Path(line)
+        if candidate.exists() and candidate.is_file():
+            file_path = candidate
+            break
+    if not file_path:
+        raise HTTPException(status_code=500, detail="Video downloaded but file path not found")
+
+    filename = safe_name(file_path.name)
+    generate_video_thumbnail(filename)
+    if progress_callback:
+        progress_callback(100.0, "Download complete")
+    return filename
+
+def finalize_imported_video_for_user(user, filename: str, private_upload: bool):
+    is_public = not bool(private_upload)
+    upsert_file_record("video", filename, user["id"] if user else None, is_public)
+    if user:
+        notify_followers_public_upload(user, "video", filename)
+
+def set_youtube_job(job_id: str, **updates):
+    with YOUTUBE_IMPORT_JOBS_LOCK:
+        job = YOUTUBE_IMPORT_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+
+def run_youtube_import_job(job_id: str, video_url: str, user_snapshot, private_upload: bool):
+    try:
+        set_youtube_job(job_id, status="downloading", progress=1.0, message="Starting download...")
+
+        def callback(percent: float, message: str):
+            safe_percent = max(0.0, min(100.0, float(percent)))
+            set_youtube_job(job_id, progress=safe_percent, message=message)
+
+        imported_file = import_youtube_video_with_progress(video_url, callback)
+        finalize_imported_video_for_user(user_snapshot, imported_file, private_upload)
+        set_youtube_job(job_id, status="completed", progress=100.0, filename=imported_file, message="Import complete")
+    except Exception as ex:
+        set_youtube_job(job_id, status="error", message=str(ex))
 
 def h(value) -> str:
     return html.escape(str(value), quote=True)
@@ -779,12 +876,34 @@ def generate_video_thumbnail(video_name: str) -> Optional[Path]:
 # --- 3. UI STYLES ---
 COMMON_STYLE = """
 <style>
-    body { font-family: -apple-system, sans-serif; max-width: 900px; margin: auto; padding: 20px; background: #f8f9fa; color: #333; }
-    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+    body { font-family: -apple-system, sans-serif; max-width: 900px; margin: auto; padding: 20px; background: #f8f9fa; color: #333; transition: background .2s ease, color .2s ease; }
+    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; transition: background .2s ease, border-color .2s ease, box-shadow .2s ease; }
+    body.theme-dark { background: #121212; color: #e8e8e8; }
+    body.theme-dark .card { background: #1f1f1f; color: #e8e8e8; box-shadow: 0 2px 4px rgba(0,0,0,0.45); }
+    body.theme-dark a { color: #9ecbff; }
+    body.theme-dark .helper, body.theme-dark .chat-meta, body.theme-dark .social-username { color: #b7b7b7; }
+    body.theme-dark .note-item, body.theme-dark .social-user, body.theme-dark th, body.theme-dark td { border-color: #343434; }
+    body.theme-dark th { background: #2a2a2a; color: #ddd; }
+    body.theme-dark .preview-box, body.theme-dark .social-col, body.theme-dark input[type="text"], body.theme-dark input[type="password"], body.theme-dark input[type="file"], body.theme-dark textarea, body.theme-dark select { background: #181818; color: #eee; border-color: #3c3c3c; }
+    body.layout-wide { max-width: 1250px; }
+    body.layout-focus .home-grid { grid-template-columns: 1fr; }
+    body.layout-compact { font-size: 0.95em; }
+    body.layout-compact .card { padding: 14px; margin-bottom: 14px; }
     .nav-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
     .helper { color: #666; font-size: 0.85em; margin-top: 6px; }
     .notice-ok { color:#155724; background:#d4edda; padding:8px; border-radius:4px; }
     .notice-bad { color:#721c24; background:#f8d7da; padding:8px; border-radius:4px; }
+    .progress-wrap { margin-top: 10px; }
+    .progress-label { font-size: 0.85em; color: #444; margin-bottom: 4px; }
+    .progress-value { width: 100%; height: 14px; }
+    .display-controls { display:flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .display-controls select { min-width: 160px; padding: 8px; border-radius: 4px; border: 1px solid #ddd; }
+    .global-display-toolbar { position: sticky; top: 8px; z-index: 50; background: rgba(255,255,255,0.92); border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; margin: 0 0 12px auto; width: fit-content; backdrop-filter: blur(4px); }
+    .global-display-toolbar .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .global-display-toolbar select { padding: 6px 8px; border-radius: 4px; border: 1px solid #ddd; }
+    .global-display-toolbar button { padding: 6px 10px; border: 0; border-radius: 4px; background: #6c757d; color: #fff; cursor: pointer; }
+    body.theme-dark .global-display-toolbar { background: rgba(25,25,25,0.92); border-color: #3c3c3c; }
+    body.theme-dark .global-display-toolbar select { background: #181818; color: #eee; border-color: #3c3c3c; }
     .btn { padding: 8px 16px; border-radius: 4px; text-decoration: none; font-weight: bold; cursor: pointer; border: none; display: inline-block; font-size: 0.9em; }
     .btn-primary { background: #007bff; color: white; }
     .btn-success { background: #28a745; color: white; }
@@ -847,6 +966,65 @@ COMMON_STYLE = """
     input[type="text"], input[type="password"], input[type="file"], textarea { padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
     form { display: flex; gap: 10px; align-items: center; }
 </style>
+<script>
+    (function() {
+        const themeKey = 'fp_theme';
+        const layoutKey = 'fp_layout';
+
+        function applyView(theme, layout) {
+            document.body.classList.toggle('theme-dark', theme === 'dark');
+            document.body.classList.remove('layout-wide', 'layout-focus', 'layout-compact');
+            if (layout === 'wide') document.body.classList.add('layout-wide');
+            if (layout === 'focus') document.body.classList.add('layout-focus');
+            if (layout === 'compact') document.body.classList.add('layout-compact');
+        }
+
+        function buildToolbar() {
+            if (document.getElementById('globalDisplayToolbar')) return;
+            const wrapper = document.createElement('div');
+            wrapper.className = 'global-display-toolbar';
+            wrapper.id = 'globalDisplayToolbar';
+            wrapper.innerHTML = "<div class='row'><strong style='font-size:0.85em;'>Display</strong><label style='font-size:0.8em;'>Theme <select id='globalThemeSelect'><option value='light'>Light</option><option value='dark'>Dark</option></select></label><label style='font-size:0.8em;'>Layout <select id='globalLayoutSelect'><option value='standard'>Standard</option><option value='wide'>Wide</option><option value='focus'>Focus</option><option value='compact'>Compact</option></select></label><button id='globalDisplayResetBtn' type='button'>Reset</button></div>";
+            document.body.insertBefore(wrapper, document.body.firstChild);
+
+            const themeSelect = document.getElementById('globalThemeSelect');
+            const layoutSelect = document.getElementById('globalLayoutSelect');
+            const resetBtn = document.getElementById('globalDisplayResetBtn');
+            const savedTheme = localStorage.getItem(themeKey) || 'light';
+            const savedLayout = localStorage.getItem(layoutKey) || 'standard';
+            themeSelect.value = savedTheme;
+            layoutSelect.value = savedLayout;
+            applyView(savedTheme, savedLayout);
+
+            themeSelect.addEventListener('change', function() {
+                localStorage.setItem(themeKey, themeSelect.value);
+                applyView(themeSelect.value, layoutSelect.value);
+            });
+            layoutSelect.addEventListener('change', function() {
+                localStorage.setItem(layoutKey, layoutSelect.value);
+                applyView(themeSelect.value, layoutSelect.value);
+            });
+            resetBtn.addEventListener('click', function() {
+                localStorage.setItem(themeKey, 'light');
+                localStorage.setItem(layoutKey, 'standard');
+                themeSelect.value = 'light';
+                layoutSelect.value = 'standard';
+                applyView('light', 'standard');
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            try {
+                const savedTheme = localStorage.getItem(themeKey) || 'light';
+                const savedLayout = localStorage.getItem(layoutKey) || 'standard';
+                applyView(savedTheme, savedLayout);
+                buildToolbar();
+            } catch (_) {
+                applyView('light', 'standard');
+            }
+        });
+    })();
+</script>
 """
 
 # --- 4. ROUTES ---
@@ -1802,6 +1980,10 @@ def web_home(
             </label>
             <button type='submit' class='btn btn-primary'>Import URL</button>
         </form>
+        <div id='ytProgressWrap' class='progress-wrap' style='display:none;'>
+            <div id='ytProgressLabel' class='progress-label'>Preparing download...</div>
+            <progress id='ytProgressBar' class='progress-value' value='0' max='100'></progress>
+        </div>
     </div>
     <form action='/' method='get' style='margin-bottom:20px;'>
         <input type='text' name='q' placeholder='Search notes, tags, or content...' style='flex-grow:1' value='{h(q or "")}'>
@@ -1873,7 +2055,7 @@ def web_home(
                         <strong>{h(item['title'])}</strong><br>
                         <small>{h(item['uploader'])}{h(duration_label)}</small>
                     </div>
-                    <form action='/videos/import-youtube' method='post' style='margin:0;'>
+                    <form action='/videos/import-youtube' method='post' class='yt-import-form' style='margin:0;'>
                         <input type='hidden' name='csrf_token' value='{h(csrf_token)}'>
                         <input type='hidden' name='video_url' value='{h(item['video_url'])}'>
                         <input type='hidden' name='yt_q' value='{h(yt_q or "")}'>
@@ -2094,7 +2276,62 @@ def web_home(
             </div>
         </div>"""
 
-    page = f"<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{actions_html}{text_search_html}{yt_search_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body></html>"
+    page = f"""<html><head>{COMMON_STYLE}</head><body><h1>🚀 Library</h1>{auth_html}{global_notice_html}{quick_nav_html}{setup_html}{recommendations_html}{actions_html}{text_search_html}{yt_search_html}<div class='home-grid'><div class='card' id='notes'><h2>📝 Notes</h2>{notes_html or '<p>No notes found.</p>'}</div>{chat_html}{follow_html}</div><div class='card' id='data'><h2>📊 Data</h2>{datasets_html or '<p>No data found.</p>'}</div><div class='card' id='videos'><h2>🎬 Videos</h2><div class='video-grid'>{videos_html or '<p>No videos found.</p>'}</div></div></body><script>
+    (function() {{
+        const progressWrap = document.getElementById('ytProgressWrap');
+        const progressBar = document.getElementById('ytProgressBar');
+        const progressLabel = document.getElementById('ytProgressLabel');
+        const forms = Array.from(document.querySelectorAll("form[action='/videos/import-youtube']"));
+
+        async function startImport(form) {{
+            const formData = new FormData(form);
+            const ytQ = formData.get('yt_q') || '';
+            progressWrap.style.display = 'block';
+            progressBar.value = 1;
+            progressLabel.textContent = 'Starting download...';
+
+            const startResp = await fetch('/videos/import-youtube/start', {{ method: 'POST', body: formData }});
+            if (!startResp.ok) {{
+                progressLabel.textContent = 'Could not start download.';
+                return;
+            }}
+            const startData = await startResp.json();
+            const jobId = startData.job_id;
+
+            const intervalId = setInterval(async () => {{
+                try {{
+                    const pollResp = await fetch(`/videos/import-youtube/progress/${{encodeURIComponent(jobId)}}`);
+                    if (!pollResp.ok) return;
+                    const data = await pollResp.json();
+                    progressBar.value = data.progress || 0;
+                    if (data.message) progressLabel.textContent = data.message;
+
+                    if (data.status === 'completed') {{
+                        clearInterval(intervalId);
+                        const imported = encodeURIComponent(data.filename || 'video');
+                        const q = encodeURIComponent(ytQ);
+                        window.location.href = `/?yt_q=${{q}}&yt_status=imported&imported_video=${{imported}}`;
+                    }} else if (data.status === 'error') {{
+                        clearInterval(intervalId);
+                        const q = encodeURIComponent(ytQ);
+                        window.location.href = `/?yt_q=${{q}}&yt_status=error`;
+                    }}
+                }} catch (err) {{
+                    clearInterval(intervalId);
+                    progressLabel.textContent = 'Download check failed.';
+                }}
+            }}, 900);
+        }}
+
+        for (const form of forms) {{
+            form.classList.add('yt-import-form');
+            form.addEventListener('submit', function(e) {{
+                e.preventDefault();
+                startImport(form);
+            }});
+        }}
+    }})();
+    </script></html>"""
     response = HTMLResponse(content=page)
     response.set_cookie("csrf_token", csrf_token, samesite="lax")
     return response
@@ -2402,14 +2639,57 @@ def import_youtube_video_route(
         imported_file = import_youtube_video(video_url)
     except Exception:
         return RedirectResponse(f"/?yt_q={u(yt_q)}&yt_status=error", status_code=303)
-    is_public = not bool(private_upload)
-    upsert_file_record("video", imported_file, user["id"] if user else None, is_public)
-    if user:
-        notify_followers_public_upload(user, "video", imported_file)
+    finalize_imported_video_for_user(user, imported_file, bool(private_upload))
     return RedirectResponse(
         f"/?yt_q={u(yt_q)}&yt_status=imported&imported_video={u(imported_file)}",
         status_code=303,
     )
+
+@app.post("/videos/import-youtube/start")
+def start_youtube_import_route(
+    request: Request,
+    video_url: str = Form(...),
+    private_upload: Optional[str] = Form(None),
+    csrf_token: str = Form(""),
+):
+    validate_csrf(request, csrf_token)
+    user = get_current_user(request)
+    if private_upload and not user:
+        raise HTTPException(status_code=403, detail="Login required to upload private files")
+
+    job_id = str(uuid.uuid4())
+    user_snapshot = None
+    if user:
+        user_snapshot = {"id": user["id"], "username": user["username"], "role": user["role"], "public_name": user.get("public_name") if hasattr(user, "get") else user["public_name"]}
+    with YOUTUBE_IMPORT_JOBS_LOCK:
+        YOUTUBE_IMPORT_JOBS[job_id] = {
+            "status": "queued",
+            "progress": 0.0,
+            "message": "Queued",
+            "filename": None,
+            "created_at": datetime.datetime.utcnow().isoformat(),
+        }
+
+    worker = threading.Thread(
+        target=run_youtube_import_job,
+        args=(job_id, video_url, user_snapshot, bool(private_upload)),
+        daemon=True,
+    )
+    worker.start()
+    return JSONResponse({"job_id": job_id, "status": "queued"})
+
+@app.get("/videos/import-youtube/progress/{job_id}")
+def youtube_import_progress_route(job_id: str):
+    with YOUTUBE_IMPORT_JOBS_LOCK:
+        job = YOUTUBE_IMPORT_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Import job not found")
+    return JSONResponse({
+        "status": job.get("status"),
+        "progress": job.get("progress", 0.0),
+        "message": job.get("message", ""),
+        "filename": job.get("filename"),
+    })
 
 @app.get("/videos/{filename}", response_class=HTMLResponse)
 def view_video(request: Request, filename: str):
